@@ -3,7 +3,7 @@
  *
  * このファイルは scripts/build.js が src/*.js から生成したもの。直接編集しない。
  * 貼り付け方：Apps Script エディタで既存のコードを全部消して、これを1ファイルに貼る。
- * appsscript.json（権限の設定）は別途 src/appsscript.json の内容で置き換える。
+ * appsscript.json は触らなくてよい（権限は Apps Script がコードから自動で判定する）。
  */
 // ===== Config.js ======================================================
 

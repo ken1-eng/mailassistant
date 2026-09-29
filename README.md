@@ -43,8 +43,8 @@ Gmail の未読メールを Jev で採点して重要度ラベルを付け（①
    ```
    clasp を使わない場合は、エディタで既存ファイルを消し `src/` の各ファイルを同名で作って貼る
    **1ファイルで貼る場合**：`dist/Code.gs` を丸ごと1ファイルに貼ればよい（`src/*.js` を連結したもの。
-   `src/` を変更したら `npm run build` で作り直す）。`appsscript.json` はエディタの「プロジェクトの設定」で
-   マニフェストを表示させ、`src/appsscript.json` の内容で置き換える
+   `src/` を変更したら `npm run build` で作り直す）。`appsscript.json` は触らなくてよい。
+   権限（oauthScopes）は明示せず、Apps Script がコードから自動で判定する
 3. スクリプトプロパティを追加する（既存の `TYPESAFE_API_KEY` などはそのまま）
 
    | キー | 必須 | 内容 |
