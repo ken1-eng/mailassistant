@@ -1188,6 +1188,7 @@ function showLogSheet() {
  *   setup()           初回に1回。ラベル・ログシート・開始日・5分おきトリガーを用意する
  *   triageInbox()     トリガーから呼ばれる本処理
  *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
+ *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
  *   resetDailyCount() 1日あたり上限のカウントをリセットする
@@ -1249,6 +1250,86 @@ function triageInbox() {
  */
 function dryRun() {
   run_(true);
+}
+
+/**
+ * 今届いているメールで、カレンダー登録が「どうなるか」を見る。
+ * CAL_STAGE に関係なく ④⑤ の照合まで行うが、カレンダー・ラベル・マーカーには一切書かない。
+ * 対象は直近7日（処理済みかどうかは問わない）。日次上限にも数えない。
+ * 結果は実行ログに一覧で出し、予定登録ログにもモード「preview」で残す。
+ */
+function previewCalendar() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10 * 1000)) return;
+  try {
+    const startedAt = Date.now();
+    const ctx = { dry: true, stage: CAL_STAGE.MATCH, me: myAddresses_(), domains: internalDomains_() };
+    const threads = GmailApp.search(CONFIG.CAL_QUERY + ' newer_than:7d', 0, CONFIG.MAX_THREADS);
+    const lines = [];
+
+    threads.forEach((thread) => {
+      if (Date.now() - startedAt > CONFIG.RUN_TIME_BUDGET_MS) return;
+      const msg = pickMessage_(thread, ctx.me);
+      if (!msg) return;
+      const mail = toMail_(msg, thread, ctx.domains);
+      try {
+        const answers = jevAsk_(buildState_(mail), SCHEDULE_QUESTIONS);
+        const row = calendarOne_(mail, answers, ctx);
+        logCalendar_('preview', mail, answers, row);
+        lines.push({ row: row, text: previewLine_(mail, row) });
+      } catch (e) {
+        lines.push({ row: { action: 'error' }, text: `⚠️ エラー | ${mail.subject} | ${e.message}` });
+      }
+    });
+
+    // 予定として扱われたものを上に
+    const rank = (a) => (/^would:/.test(a) ? 0 : a === 'notify' || a === 'error' ? 1 : 2);
+    lines.sort((x, y) => rank(x.row.action) - rank(y.row.action));
+    console.log(`直近7日の ${lines.length} 通（カレンダーには書き込んでいません）`);
+    lines.forEach((l) => console.log(l.text));
+    if (Date.now() - startedAt > CONFIG.RUN_TIME_BUDGET_MS) console.log('時間切れのため途中まで');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+const PREVIEW_ACTIONS = {
+  'would:create': '📅 新規登録する',
+  'would:none': '✅ 登録済みなので何もしない',
+  'would:update': '🔁 既存予定の日時を更新する',
+  'would:mark_cancelled': '🚫 既存予定に【中止】を付ける',
+  'would:notify': '🔔 迷うので通知のみ',
+  'would:skip': '― 何もしない',
+  notify: '🔔 通知のみ',
+  error: '⚠️ エラー',
+  skip: '― 予定ではない',
+};
+
+const PREVIEW_REASONS = {
+  no_schedule: '予定の連絡ではない',
+  not_participant: '自分は参加者ではない',
+  not_schedule: '予定ではない',
+  proposal: '日程調整中（候補提示）',
+  low_confidence_type: '予定の種類の判定が曖昧',
+  no_datetime: '日時を抽出できなかった',
+  no_existing: '近くに既存予定なし',
+  all_unrelated: '近くの予定はすべて別件',
+  already_registered: '同じ予定が既にある',
+  rescheduled: '日時変更',
+  cancelled: '中止',
+  cancel_without_existing: '中止連絡だが対象の予定がない',
+  cancel_without_match: '中止連絡だが対象の予定がない',
+  relation_cannot_tell: '既存予定との関係が判断できない',
+  low_confidence_relation: '既存予定との関係の判定が曖昧',
+};
+
+function previewLine_(mail, row) {
+  const parts = [PREVIEW_ACTIONS[row.action] || row.action, mail.subject.slice(0, 40)];
+  if (row.ev) parts.push(`${formatJst_(row.ev.start, row.ev.allDay)} ${row.ev.title}`);
+  if (row.matched) parts.push('既存: ' + row.matched);
+  parts.push(PREVIEW_REASONS[row.reason] || row.reason || '');
+  if (row.note) parts.push(row.note);
+  return parts.filter(Boolean).join(' | ');
 }
 
 function run_(dry) {
