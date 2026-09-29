@@ -1,0 +1,10 @@
+{
+  "name": "mailassistant",
+  "private": true,
+  "description": "Gmail トリアージとメール→カレンダー自動登録（Google Apps Script）",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "push": "clasp push",
+    "deploy": "npm test && clasp push"
+  }
+}
