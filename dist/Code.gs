@@ -68,6 +68,7 @@ const CONFIG = {
     THRESHOLDS: {
       HAS_SCHEDULE: 0.8, // 高めにして取りこぼす方に倒す
       I_PARTICIPATE: 0.6,
+      PERSONALLY_INVITED: 0.6, // メーリングリスト経由のときだけ使う
       SCHEDULE_TYPE_CONFIDENCE: 0.7, // 未満なら通知のみ
       SAME_EVENT: 0.5, // 以上なら新規登録しない（迷ったら止める）
       RELATION_CONFIDENCE: 0.7, // 未満なら更新・中止印を付けず通知のみ
@@ -517,6 +518,18 @@ const SCHEDULE_QUESTIONS = [
     },
   },
   {
+    // メーリングリスト経由のときだけ効かせる（scheduleGate_ 参照）。
+    // 「参加予定の皆様へ」のような一斉連絡は i_participate では落としきれないため、事実に割って聞く
+    name: 'personally_invited',
+    type: 'noul',
+    instructions: '受信者個人がこの予定への出席を求められている、または受信者が出席することが本文から分かるか。',
+    criteria: {
+      true: '受信者を名指しした招待や依頼、受信者の出席表明への返信、受信者の役割（司会・発表・担当など）が書かれている',
+      false:
+        '「参加予定の皆様へ」「委員各位」「関係者各位」など対象を限った一斉連絡で、受信者がその対象に含まれるか本文から分からない。または全員向けの告知',
+    },
+  },
+  {
     name: 'schedule_type',
     type: 'choice',
     instructions: 'このメールは予定について何を伝えているか。1つ選んでください。',
@@ -560,20 +573,38 @@ function sameEventQuestions_() {
 
 /**
  * ② の結果から、③ 以降に進むかを決める。
+ * @param {Object} a parseJevAnswers_ の結果
+ * @param {{isMailingList: boolean}=} meta コード側で求めた値
  * @return {{proceed: boolean, notifyOnly: boolean, reason: string}}
  */
-function scheduleGate_(a) {
+function scheduleGate_(a, meta) {
+  meta = meta || {};
   const th = CONFIG.CAL.THRESHOLDS;
   const v = (k) => (a[k] === null || a[k] === undefined ? 0 : a[k]);
   const type = a.schedule_type || {};
 
   if (v('has_schedule') < th.HAS_SCHEDULE) return gate_(false, false, 'no_schedule');
   if (v('i_participate') < th.I_PARTICIPATE) return gate_(false, false, 'not_participant');
+  // メーリングリストの一斉連絡は、個人として出席を求められていると分かるときだけ通す
+  if (meta.isMailingList && v('personally_invited') < th.PERSONALLY_INVITED) {
+    return gate_(false, false, 'ml_not_personal');
+  }
   if (!type.choice || type.choice === 'not_schedule') return gate_(false, false, 'not_schedule');
   // 候補提示を登録すると日程調整の往復がすべてカレンダーに入って壊れる
   if (type.choice === 'proposal') return gate_(false, false, 'proposal');
   if ((type.confidence || 0) < th.SCHEDULE_TYPE_CONFIDENCE) return gate_(false, true, 'low_confidence_type');
   return gate_(true, false, type.choice);
+}
+
+/**
+ * メーリングリスト経由のメールか。ヘッダから確実に分かるので Jev に聞かない。
+ * @param {{listId: string, listPost: string, precedence: string}} headers
+ */
+function isMailingList_(headers, subject) {
+  if (headers.listId || headers.listPost) return true;
+  if (/^(list|bulk)$/i.test(String(headers.precedence || '').trim())) return true;
+  // [ex-ac:12814] のような ML の通し番号付き件名
+  return /^\s*(?:(?:re|fw|fwd)\s*[:：]\s*)*[\[【(（][^\]】)）\s]+[:：]\s*\d+[\]】)）]/i.test(String(subject || ''));
 }
 
 function gate_(proceed, notifyOnly, reason) {
@@ -1308,6 +1339,7 @@ const PREVIEW_ACTIONS = {
 const PREVIEW_REASONS = {
   no_schedule: '予定の連絡ではない',
   not_participant: '自分は参加者ではない',
+  ml_not_personal: 'ML の一斉連絡で、自分が出席者か分からない',
   not_schedule: '予定ではない',
   proposal: '日程調整中（候補提示）',
   low_confidence_type: '予定の種類の判定が曖昧',
@@ -1487,8 +1519,9 @@ function calendarOne_(mail, a, ctx) {
   const writes = !ctx.dry && ctx.stage >= CAL_STAGE.PROVISIONAL;
 
   // ② 予定を含むか
-  const gate = scheduleGate_(a);
+  const gate = scheduleGate_(a, { isMailingList: mail.isMailingList });
   row.reason = gate.reason;
+  if (mail.isMailingList) row.note = `ML personally_invited=${r2_(a.personally_invited)}`;
   if (!gate.proceed) {
     row.action = gate.notifyOnly ? 'notify' : 'skip';
     if (gate.notifyOnly && writes) notifyCalendar_(mail, null, gate.reason);
@@ -1514,7 +1547,7 @@ function calendarOne_(mail, a, ctx) {
     return row;
   }
   row.ev = ev;
-  row.note = ev.note || '';
+  row.note = [row.note, ev.note].filter(Boolean).join(' / ');
   if (ctx.stage < CAL_STAGE.MATCH) {
     row.action = 'extracted';
     return row;
@@ -1563,10 +1596,22 @@ function toMail_(msg, thread, domains) {
     from: msg.getFrom(),
     date: msg.getDate(),
     isExternal: isExternalSender_(msg.getFrom(), domains),
+    isMailingList: isMailingList_(listHeaders_(msg), msg.getSubject()),
     toCount: (msg.getTo() + ',' + msg.getCc()).split(',').filter((s) => s.trim()).length,
     body: fullBody.slice(0, CONFIG.BODY_LIMIT),
     fullBody: fullBody,
   };
+}
+
+function listHeaders_(msg) {
+  const h = (name) => {
+    try {
+      return msg.getHeader(name) || '';
+    } catch (e) {
+      return '';
+    }
+  };
+  return { listId: h('List-Id'), listPost: h('List-Post'), precedence: h('Precedence') };
 }
 
 /** Jev に渡す state（既存スクリプトと同じ形）。社外判定と宛先人数はヘッダから分かるのでコード側で入れる */

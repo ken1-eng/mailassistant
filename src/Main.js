@@ -124,6 +124,7 @@ const PREVIEW_ACTIONS = {
 const PREVIEW_REASONS = {
   no_schedule: '予定の連絡ではない',
   not_participant: '自分は参加者ではない',
+  ml_not_personal: 'ML の一斉連絡で、自分が出席者か分からない',
   not_schedule: '予定ではない',
   proposal: '日程調整中（候補提示）',
   low_confidence_type: '予定の種類の判定が曖昧',
@@ -303,8 +304,9 @@ function calendarOne_(mail, a, ctx) {
   const writes = !ctx.dry && ctx.stage >= CAL_STAGE.PROVISIONAL;
 
   // ② 予定を含むか
-  const gate = scheduleGate_(a);
+  const gate = scheduleGate_(a, { isMailingList: mail.isMailingList });
   row.reason = gate.reason;
+  if (mail.isMailingList) row.note = `ML personally_invited=${r2_(a.personally_invited)}`;
   if (!gate.proceed) {
     row.action = gate.notifyOnly ? 'notify' : 'skip';
     if (gate.notifyOnly && writes) notifyCalendar_(mail, null, gate.reason);
@@ -330,7 +332,7 @@ function calendarOne_(mail, a, ctx) {
     return row;
   }
   row.ev = ev;
-  row.note = ev.note || '';
+  row.note = [row.note, ev.note].filter(Boolean).join(' / ');
   if (ctx.stage < CAL_STAGE.MATCH) {
     row.action = 'extracted';
     return row;
@@ -379,10 +381,22 @@ function toMail_(msg, thread, domains) {
     from: msg.getFrom(),
     date: msg.getDate(),
     isExternal: isExternalSender_(msg.getFrom(), domains),
+    isMailingList: isMailingList_(listHeaders_(msg), msg.getSubject()),
     toCount: (msg.getTo() + ',' + msg.getCc()).split(',').filter((s) => s.trim()).length,
     body: fullBody.slice(0, CONFIG.BODY_LIMIT),
     fullBody: fullBody,
   };
+}
+
+function listHeaders_(msg) {
+  const h = (name) => {
+    try {
+      return msg.getHeader(name) || '';
+    } catch (e) {
+      return '';
+    }
+  };
+  return { listId: h('List-Id'), listPost: h('List-Post'), precedence: h('Precedence') };
 }
 
 /** Jev に渡す state（既存スクリプトと同じ形）。社外判定と宛先人数はヘッダから分かるのでコード側で入れる */

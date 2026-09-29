@@ -131,3 +131,24 @@ test('normalizeExtraction_: 終日予定・開始なし・タイムゾーンな�
 test('formatJstWithWeekday_: 受信日時に曜日を付ける', () => {
   assert.equal(g.formatJstWithWeekday_(new Date('2026-09-29T01:00:00Z')), '2026-09-29T10:00:00+09:00（火曜日）');
 });
+
+test('isMailingList_: ヘッダと件名の通し番号で判定する', () => {
+  const none = { listId: '', listPost: '', precedence: '' };
+  assert.equal(g.isMailingList_({ listId: '<ex-ac.example.jp>', listPost: '', precedence: '' }, '案内'), true);
+  assert.equal(g.isMailingList_({ listId: '', listPost: '', precedence: 'bulk' }, '案内'), true);
+  assert.equal(g.isMailingList_(none, '[ex-ac:12814] 【exac全体オフ会準備】第2回準備会議について'), true);
+  assert.equal(g.isMailingList_(none, 'Re: [ex-ac:12814] 第2回準備会議'), true);
+  assert.equal(g.isMailingList_(none, '【重要なお知らせ】サービス改定'), false);
+  assert.equal(g.isMailingList_(none, '[GitHub] Sudo email verification code'), false);
+  assert.equal(g.isMailingList_(none, '打ち合わせのご案内'), false);
+});
+
+test('scheduleGate_: ML の一斉連絡は personally_invited が低ければ落とす', () => {
+  const a = sched({ personally_invited: 0.3 });
+  assert.equal(g.scheduleGate_(a, { isMailingList: true }).reason, 'ml_not_personal');
+  // ML でなければ personally_invited は見ない
+  assert.equal(g.scheduleGate_(a, { isMailingList: false }).proceed, true);
+  assert.equal(g.scheduleGate_(a).proceed, true);
+  // ML でも個人として招待されていれば通す
+  assert.equal(g.scheduleGate_(sched({ personally_invited: 0.8 }), { isMailingList: true }).proceed, true);
+});

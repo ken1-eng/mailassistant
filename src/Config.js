@@ -59,6 +59,7 @@ const CONFIG = {
     THRESHOLDS: {
       HAS_SCHEDULE: 0.8, // 高めにして取りこぼす方に倒す
       I_PARTICIPATE: 0.6,
+      PERSONALLY_INVITED: 0.6, // メーリングリスト経由のときだけ使う
       SCHEDULE_TYPE_CONFIDENCE: 0.7, // 未満なら通知のみ
       SAME_EVENT: 0.5, // 以上なら新規登録しない（迷ったら止める）
       RELATION_CONFIDENCE: 0.7, // 未満なら更新・中止印を付けず通知のみ

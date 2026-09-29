@@ -27,6 +27,18 @@ const SCHEDULE_QUESTIONS = [
     },
   },
   {
+    // メーリングリスト経由のときだけ効かせる（scheduleGate_ 参照）。
+    // 「参加予定の皆様へ」のような一斉連絡は i_participate では落としきれないため、事実に割って聞く
+    name: 'personally_invited',
+    type: 'noul',
+    instructions: '受信者個人がこの予定への出席を求められている、または受信者が出席することが本文から分かるか。',
+    criteria: {
+      true: '受信者を名指しした招待や依頼、受信者の出席表明への返信、受信者の役割（司会・発表・担当など）が書かれている',
+      false:
+        '「参加予定の皆様へ」「委員各位」「関係者各位」など対象を限った一斉連絡で、受信者がその対象に含まれるか本文から分からない。または全員向けの告知',
+    },
+  },
+  {
     name: 'schedule_type',
     type: 'choice',
     instructions: 'このメールは予定について何を伝えているか。1つ選んでください。',
@@ -70,20 +82,38 @@ function sameEventQuestions_() {
 
 /**
  * ② の結果から、③ 以降に進むかを決める。
+ * @param {Object} a parseJevAnswers_ の結果
+ * @param {{isMailingList: boolean}=} meta コード側で求めた値
  * @return {{proceed: boolean, notifyOnly: boolean, reason: string}}
  */
-function scheduleGate_(a) {
+function scheduleGate_(a, meta) {
+  meta = meta || {};
   const th = CONFIG.CAL.THRESHOLDS;
   const v = (k) => (a[k] === null || a[k] === undefined ? 0 : a[k]);
   const type = a.schedule_type || {};
 
   if (v('has_schedule') < th.HAS_SCHEDULE) return gate_(false, false, 'no_schedule');
   if (v('i_participate') < th.I_PARTICIPATE) return gate_(false, false, 'not_participant');
+  // メーリングリストの一斉連絡は、個人として出席を求められていると分かるときだけ通す
+  if (meta.isMailingList && v('personally_invited') < th.PERSONALLY_INVITED) {
+    return gate_(false, false, 'ml_not_personal');
+  }
   if (!type.choice || type.choice === 'not_schedule') return gate_(false, false, 'not_schedule');
   // 候補提示を登録すると日程調整の往復がすべてカレンダーに入って壊れる
   if (type.choice === 'proposal') return gate_(false, false, 'proposal');
   if ((type.confidence || 0) < th.SCHEDULE_TYPE_CONFIDENCE) return gate_(false, true, 'low_confidence_type');
   return gate_(true, false, type.choice);
+}
+
+/**
+ * メーリングリスト経由のメールか。ヘッダから確実に分かるので Jev に聞かない。
+ * @param {{listId: string, listPost: string, precedence: string}} headers
+ */
+function isMailingList_(headers, subject) {
+  if (headers.listId || headers.listPost) return true;
+  if (/^(list|bulk)$/i.test(String(headers.precedence || '').trim())) return true;
+  // [ex-ac:12814] のような ML の通し番号付き件名
+  return /^\s*(?:(?:re|fw|fwd)\s*[:：]\s*)*[\[【(（][^\]】)）\s]+[:：]\s*\d+[\]】)）]/i.test(String(subject || ''));
 }
 
 function gate_(proceed, notifyOnly, reason) {
