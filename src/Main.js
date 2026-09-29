@@ -1,42 +1,68 @@
 /**
- * エントリポイント。
+ * Gmail × Jev メールトリアージ ＋ メール→カレンダー自動登録
+ * ---------------------------------------------------------------
+ *   setup()           初回に1回。ラベル・ログシート・開始日・5分おきトリガーを用意する
+ *   triageInbox()     トリガーから呼ばれる本処理
+ *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
+ *   stop()            自動実行を止める
+ *   countTargets()    今の設定で何件が対象になるかを数えるだけ
+ *   resetDailyCount() 1日あたり上限のカウントをリセットする
+ *   rerunAll()        トリアージの判定をやり直す（_jev マーカーを外す）
+ *   showLogSheet()    ログシートのURLを表示する
  *
- *   setup()       初回に1回。開始日・ラベル・ログシート・5分トリガーを用意する
- *   triageInbox() トリガーから呼ばれる本処理
- *   dryRun()      手動実行用。ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
- *   teardown()    トリガーを外す
+ * 1通につき Jev へのリクエストは1回（① トリアージ9問＋② 予定判定3問をまとめる）。
+ * 何問詰めても追加の待ち時間はほぼゼロなので、質問は惜しまない。
  *
- * 1通のメールにつき Jev へのリクエストは1回（① トリアージ8問＋② 予定判定3問をまとめる）。
- * 質問を何問詰めても待ち時間はほぼ変わらないので、質問は惜しまない。
+ * 【ラベルの色】Apps Scriptからは色を設定できないので、Gmailの画面で手動で付ける。
  */
 
 function setup() {
-  if (!prop_('START_DATE')) setProp_('START_DATE', jstYmd_(new Date()));
-  [CONFIG.TRIAGE.LABEL_HIGH, CONFIG.TRIAGE.LABEL_MID, CONFIG.TRIAGE.MARKER, CONFIG.CAL.MARKER].forEach(label_);
-  const ss = logSpreadsheet_(true);
-  logSheet_(CONFIG.LOG.TRIAGE_SHEET, TRIAGE_LOG_HEADERS);
-  logSheet_(CONFIG.LOG.CAL_SHEET, CAL_LOG_HEADERS);
+  ensureLabels_();
+  getLogSheet_();
+  if (calStage_() >= CAL_STAGE.JUDGE) getCalLogSheet_();
   if (calStage_() >= CAL_STAGE.PROVISIONAL) provisionalCalendar_(true);
 
-  teardown();
+  // 開始日を今日に固定する。これより前のメールは永久に対象外
+  if (!prop_('START_DATE')) {
+    const today = jstYmd_(new Date(), '/');
+    setProp_('START_DATE', today);
+    console.log(`開始日を ${today} に設定しました。これより前のメールは処理しません。`);
+  } else {
+    console.log(`開始日は ${prop_('START_DATE')} のままです。`);
+  }
+
+  // 既存トリガーを消してから登録（重複防止）
+  deleteTriggers_();
   ScriptApp.newTrigger('triageInbox').timeBased().everyMinutes(CONFIG.TRIGGER_MINUTES).create();
 
-  console.log(
-    `setup 完了: 開始日=${prop_('START_DATE')} 段階=${calStage_()} ログ=${ss.getUrl()}` +
-      '（ラベルの色は Gmail の画面で手動で付ける）'
-  );
+  console.log(`セットアップ完了。5分おきに triageInbox が動きます（カレンダー登録の段階: ${calStage_()}）。`);
 }
 
-function teardown() {
-  ScriptApp.getProjectTriggers()
-    .filter((t) => t.getHandlerFunction() === 'triageInbox')
-    .forEach((t) => ScriptApp.deleteTrigger(t));
+/** 自動実行を止める。ラベルやログはそのまま残る */
+function stop() {
+  const n = deleteTriggers_();
+  console.log(`トリガーを ${n} 件削除しました。判定は止まります。`);
+}
+
+function deleteTriggers_() {
+  let n = 0;
+  ScriptApp.getProjectTriggers().forEach((t) => {
+    if (t.getHandlerFunction() === 'triageInbox') {
+      ScriptApp.deleteTrigger(t);
+      n++;
+    }
+  });
+  return n;
 }
 
 function triageInbox() {
   run_(false);
 }
 
+/**
+ * 閾値を決める前に、まずこれで手元の感覚と合っているか確かめる。
+ * ラベルは付けず、ログに採点結果だけ出す。
+ */
 function dryRun() {
   run_(true);
 }
@@ -54,41 +80,54 @@ function run_(dry) {
 function runLocked_(dry) {
   const startedAt = Date.now();
   const stage = calStage_();
-  const startDate = prop_('START_DATE');
-  if (!startDate && !dry) throw new Error('START_DATE が未設定。setup() を先に実行する');
-  const after = startDate || jstYmd_(new Date(Date.now() - 3 * 86400000));
 
-  const limit = Math.min(CONFIG.LIMITS.PER_RUN, dry ? CONFIG.LIMITS.PER_RUN : dailyRemaining_());
-  if (limit <= 0) {
-    console.log(`1日あたり上限（${CONFIG.LIMITS.PER_RUN}件/回, ${CONFIG.LIMITS.PER_DAY}件/日）に達したので終了`);
+  const budget = dry ? CONFIG.MAX_THREADS : remainingToday_();
+  if (budget <= 0) {
+    console.log(`本日の上限 ${CONFIG.MAX_PER_DAY} 件に達しています。処理をスキップします。`);
     return;
   }
+  const limit = Math.min(CONFIG.MAX_THREADS, budget);
+  const targets = findTargets_(stage, dry, limit);
+  const ctx = { dry: dry, stage: stage, me: myAddresses_(), domains: internalDomains_(), ranking: [] };
 
-  const targets = findTargets_(after, stage, dry, limit);
-  const ctx = { dry: dry, stage: stage, me: myAddresses_(), domains: internalDomains_() };
-
+  let done = 0;
+  let failed = 0;
   for (let i = 0; i < targets.length; i++) {
-    if (Date.now() - startedAt > CONFIG.LIMITS.RUN_TIME_BUDGET_MS) {
+    if (Date.now() - startedAt > CONFIG.RUN_TIME_BUDGET_MS) {
       console.log('実行時間の上限に近づいたので残りは次回');
       break;
     }
     try {
       processThread_(targets[i], ctx);
+      done++;
     } catch (e) {
-      // マーカーを付けずに残すので次回また拾う。日次上限にはカウントするので暴走はしない
-      console.error(`処理失敗 thread=${targets[i].thread.getId()}: ${e.stack || e}`);
+      // マーカーを付けずに残すので次回また拾う
+      console.error(`失敗: ${targets[i].thread.getFirstMessageSubject()} / ${e.message}`);
+      failed++;
     }
-    if (!dry) countDaily_();
   }
+
+  if (dry) {
+    // 点数順に並べる。絶対値ではなく「並び順」が自分の感覚と合うかを見る
+    ctx.ranking.sort((x, y) => y.score - x.score);
+    ctx.ranking.forEach((r) => console.log(`${r.score}点 [${r.bucket}] ${r.subject.slice(0, 50)}`));
+    console.log('--- 詳細はログシートを見てください（showLogSheet で URL 表示）---');
+    return;
+  }
+
+  // 失敗も数える。同じメールで失敗し続けても1日の上限で止まる
+  consumeToday_(done + failed);
+  console.log(`処理 ${done}件 / 失敗 ${failed}件（本日の残り ${remainingToday_()}件）`);
 }
 
 /**
  * 処理対象のスレッドを集める。
- * トリアージは未読が対象（既存スクリプトと同じ）。
- * 予定判定は既読でも対象にする（予定の見落としを避ける。二重処理は _cal マーカーで防ぐ）。
+ * トリアージは未読のみ（既存どおり）。予定判定は既読でも対象にする。
+ * 処理済みマーカーは検索クエリで除外する（検索後に飛ばすと、未読のまま残った処理済みスレッドが
+ * 1回あたりの枠を埋め続けて新着が処理されなくなる）。
  */
-function findTargets_(after, stage, dry, limit) {
-  const base = `after:${after.replace(/-/g, '/')} -in:chats -in:drafts`;
+function findTargets_(stage, dry, limit) {
+  const after = ' after:' + startDate_(dry);
   const needCal = stage >= CAL_STAGE.JUDGE;
   const map = {};
   const add = (threads, key) =>
@@ -98,16 +137,33 @@ function findTargets_(after, stage, dry, limit) {
       map[id][key] = true;
     });
 
-  if (dry) {
-    add(GmailApp.search(`${base} is:unread`, 0, limit), 'needTriage');
-    if (needCal) add(GmailApp.search(base, 0, limit), 'needCal');
-  } else {
-    add(GmailApp.search(`${base} is:unread -label:${CONFIG.TRIAGE.MARKER}`, 0, limit), 'needTriage');
-    if (needCal) add(GmailApp.search(`${base} -label:${CONFIG.CAL.MARKER}`, 0, limit), 'needCal');
-  }
+  const triageMark = dry ? '' : ` -label:${CONFIG.LABELS.PROCESSED}`;
+  const calMark = dry ? '' : ` -label:${CONFIG.LABELS.CAL_PROCESSED}`;
+  add(GmailApp.search(CONFIG.TRIAGE_QUERY + after + triageMark, 0, limit), 'needTriage');
+  if (needCal) add(GmailApp.search(CONFIG.CAL_QUERY + after + calMark, 0, limit), 'needCal');
+
   return Object.keys(map)
     .map((k) => map[k])
     .slice(0, limit);
+}
+
+function startDate_(dry) {
+  const start = prop_('START_DATE');
+  if (start) return start.replace(/-/g, '/');
+  if (dry) return jstYmd_(new Date(Date.now() - 3 * 86400000), '/');
+  throw new Error('開始日が未設定です。先に setup() を実行してください。');
+}
+
+/** 今の設定で何件が対象になるかを、処理せずに数えるだけ */
+function countTargets() {
+  const after = ' after:' + startDate_(false);
+  const triage = GmailApp.search(CONFIG.TRIAGE_QUERY + after + ` -label:${CONFIG.LABELS.PROCESSED}`, 0, 500);
+  console.log(`トリアージ対象: ${triage.length}件（500で打ち切り）`);
+  if (calStage_() >= CAL_STAGE.JUDGE) {
+    const cal = GmailApp.search(CONFIG.CAL_QUERY + after + ` -label:${CONFIG.LABELS.CAL_PROCESSED}`, 0, 500);
+    console.log(`予定判定対象: ${cal.length}件（500で打ち切り）`);
+  }
+  console.log(`本日の残り処理枠: ${remainingToday_()}件`);
 }
 
 function processThread_(target, ctx) {
@@ -119,40 +175,43 @@ function processThread_(target, ctx) {
     return;
   }
 
-  const mail = toMail_(msg, thread);
+  const mail = toMail_(msg, thread, ctx.domains);
   const questions = []
     .concat(target.needTriage ? TRIAGE_QUESTIONS : [])
     .concat(target.needCal ? SCHEDULE_QUESTIONS : []);
-  const answers = jevAsk_(mailState_(mail), questions);
-  const mode = ctx.dry ? 'dry-run' : '本番';
+  const answers = jevAsk_(buildState_(mail), questions);
 
   if (target.needTriage) {
-    const r = triageOne_(mail, answers, ctx);
+    const r = triageOne_(mail, answers);
     if (!ctx.dry) {
-      if (r.label) thread.addLabel(label_(r.label));
-      if (r.label === CONFIG.TRIAGE.LABEL_HIGH) notifyUrgent_(mail, r.score);
+      const labelName = CONFIG.LABELS[r.bucket]; // LOW はラベルを付けない
+      if (labelName) thread.addLabel(label_(labelName));
+      if (r.bucket === 'HIGH') notifyUrgent_(mail, r);
     }
-    logTriage_(mode, mail, answers, r);
+    logToSheet_(mail, answers, r);
+    ctx.ranking.push({ score: r.score, bucket: r.bucket, subject: mail.subject });
+    console.log(`[${r.bucket}] ${mail.subject} (score ${r.score} / ${r.category})`);
   }
 
   if (target.needCal) {
     const row = calendarOne_(mail, answers, ctx);
-    logCalendar_(mode, mail, answers, row);
+    logCalendar_(ctx.dry ? 'dry-run' : '本番', mail, answers, row);
   }
 
   if (!ctx.dry) markDone_(thread, target);
 }
 
 function markDone_(thread, target) {
-  if (target.needTriage) thread.addLabel(label_(CONFIG.TRIAGE.MARKER));
-  if (target.needCal) thread.addLabel(label_(CONFIG.CAL.MARKER));
+  if (target.needTriage) thread.addLabel(label_(CONFIG.LABELS.PROCESSED));
+  if (target.needCal) thread.addLabel(label_(CONFIG.LABELS.CAL_PROCESSED));
 }
 
-function triageOne_(mail, a, ctx) {
-  const deadlineDays = daysUntilDeadline_(mail.subject + '\n' + mail.body, new Date());
-  const isExternal = isExternalSender_(mail.from, ctx.domains);
-  const score = scoreTriage_(a, { deadlineDays: deadlineDays, isExternal: isExternal });
-  return { score: score, label: triageLabelFor_(score), deadlineDays: deadlineDays, isExternal: isExternal };
+function triageOne_(mail, a) {
+  // 期限の日数は has_deadline が立ったときだけ計算する
+  const deadlineDays = a.has_deadline > 0.5 ? daysUntilDeadline_(mail.fullBody, mail.date) : null;
+  const r = scoreTriage_(a, { deadlineDays: deadlineDays, isExternal: mail.isExternal });
+  r.deadlineDays = deadlineDays;
+  return r;
 }
 
 /**
@@ -205,9 +264,9 @@ function calendarOne_(mail, a, ctx) {
   if (decision.index >= 0) {
     const m = matches[decision.index];
     row.matched = `${m.described.title} ${m.described.when}${found[decision.index].isProvisional ? '（仮登録）' : ''}`;
-    row.relation = `${fmtChoice_(m.relation)} / same=${fmtNum_(m.isSame)}`;
+    row.relation = `${fmtChoice_(m.relation)} / same=${r2_(m.isSame)}`;
   } else if (matches.length) {
-    row.matched = matches.map((m) => `${m.described.title}(${fmtNum_(m.isSame)})`).join('; ');
+    row.matched = matches.map((m) => `${m.described.title}(${r2_(m.isSame)})`).join('; ');
   }
 
   // ⑥ 登録
@@ -225,28 +284,35 @@ function calendarOne_(mail, a, ctx) {
 function pickMessage_(thread, me) {
   const msgs = thread.getMessages();
   for (let i = msgs.length - 1; i >= 0; i--) {
-    const addr = emailOf_(msgs[i].getFrom());
-    if (me.indexOf(addr) < 0) return msgs[i];
+    if (me.indexOf(emailOf_(msgs[i].getFrom())) < 0) return msgs[i];
   }
   return null;
 }
 
-function toMail_(msg, thread) {
-  const recipients = (msg.getTo() + ',' + msg.getCc()).split(',').filter((s) => /@/.test(s));
+function toMail_(msg, thread, domains) {
+  const fullBody = msg.getPlainBody();
   return {
     id: msg.getId(),
     threadId: thread.getId(),
     subject: msg.getSubject(),
     from: msg.getFrom(),
     date: msg.getDate(),
-    body: msg.getPlainBody().slice(0, CONFIG.LIMITS.BODY_CHARS),
-    recipientCount: recipients.length,
+    isExternal: isExternalSender_(msg.getFrom(), domains),
+    toCount: (msg.getTo() + ',' + msg.getCc()).split(',').filter((s) => s.trim()).length,
+    body: fullBody.slice(0, CONFIG.BODY_LIMIT),
+    fullBody: fullBody,
   };
 }
 
-/** Jev に渡す state。社外判定・宛先人数・日付の計算はコード側でやるので入れない。 */
-function mailState_(mail) {
-  return ['件名: ' + mail.subject, '差出人: ' + mail.from, '', mail.body].join('\n');
+/** Jev に渡す state（既存スクリプトと同じ形）。社外判定と宛先人数はヘッダから分かるのでコード側で入れる */
+function buildState_(mail) {
+  return {
+    subject: mail.subject,
+    from: mail.from,
+    is_external: mail.isExternal,
+    to_count: mail.toCount,
+    body: mail.body,
+  };
 }
 
 function myAddresses_() {
@@ -259,33 +325,84 @@ function emailOf_(from) {
   return (m ? m[1] : String(from || '')).trim().toLowerCase();
 }
 
+function ensureLabels_() {
+  const out = {};
+  Object.keys(CONFIG.LABELS).forEach((key) => {
+    out[key] = label_(CONFIG.LABELS[key]);
+  });
+  return out;
+}
+
 function label_(name) {
   return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
 }
 
-function jstYmd_(date) {
+function jstYmd_(date, sep) {
   const p = jstParts_(date);
-  return `${p.y}-${String(p.m).padStart(2, '0')}-${String(p.d).padStart(2, '0')}`;
+  const s = sep || '-';
+  return `${p.y}${s}${String(p.m).padStart(2, '0')}${s}${String(p.d).padStart(2, '0')}`;
 }
 
-/** 1日あたり上限。日付（日本時間）が変わるとリセット。 */
-function dailyKey_() {
-  return 'DAILY_COUNT_' + jstYmd_(new Date());
+// ===== 処理量の制御（既存スクリプトと同じ DAILY_COUNT を使う）=====
+
+/** 今日あと何件処理できるか */
+function remainingToday_() {
+  const raw = prop_('DAILY_COUNT');
+  const rec = raw ? JSON.parse(raw) : null;
+  const today = jstYmd_(new Date());
+  const used = rec && rec.date === today ? rec.count : 0;
+  return Math.max(CONFIG.MAX_PER_DAY - used, 0);
 }
 
-function dailyRemaining_() {
-  return CONFIG.LIMITS.PER_DAY - Number(prop_(dailyKey_(), '0'));
+function consumeToday_(n) {
+  if (n <= 0) return;
+  const raw = prop_('DAILY_COUNT');
+  const rec = raw ? JSON.parse(raw) : null;
+  const today = jstYmd_(new Date());
+  const used = rec && rec.date === today ? rec.count : 0;
+  setProp_('DAILY_COUNT', JSON.stringify({ date: today, count: used + n }));
 }
 
-function countDaily_() {
-  const props = PropertiesService.getScriptProperties();
-  const key = dailyKey_();
-  const n = Number(props.getProperty(key) || '0') + 1;
-  props.setProperty(key, String(n));
-  if (n === 1) {
-    // 前日以前のカウンタを掃除
-    Object.keys(props.getProperties())
-      .filter((k) => k.indexOf('DAILY_COUNT_') === 0 && k !== key)
-      .forEach((k) => props.deleteProperty(k));
+/** 上限をリセットする。今日もう少しだけ回したいとき用 */
+function resetDailyCount() {
+  PropertiesService.getScriptProperties().deleteProperty('DAILY_COUNT');
+  console.log('本日のカウントをリセットしました');
+}
+
+// ===== やり直し・移行 ============================================
+
+/**
+ * トリアージの判定をやり直す。_jev マーカーと重要度ラベルを外すので、
+ * 次の実行で同じメールがもう一度評価される。質問文や重みを変えたあとに使う。
+ */
+function rerunAll() {
+  const mark = GmailApp.getUserLabelByName(CONFIG.LABELS.PROCESSED);
+  if (!mark) {
+    console.log('マーカーラベルがありません');
+    return;
   }
+  const levels = [CONFIG.LABELS.HIGH, CONFIG.LABELS.MEDIUM]
+    .map((n) => GmailApp.getUserLabelByName(n))
+    .filter(Boolean);
+  const threads = mark.getThreads(0, 200);
+  threads.forEach((t) => {
+    t.removeLabel(mark);
+    levels.forEach((l) => t.removeLabel(l));
+  });
+  console.log(`${threads.length} 件の判定をリセットしました`);
+}
+
+/**
+ * 旧バージョンのラベルを削除する。ラベルを消してもメール本体には影響しない。
+ * 名前を変えたあとに一度だけ実行する。
+ */
+function cleanupOldLabels() {
+  ['_jev済', '01_要即対応', '03_あとで'].forEach((name) => {
+    const l = GmailApp.getUserLabelByName(name);
+    if (l) {
+      l.deleteLabel();
+      console.log('削除: ' + name);
+    }
+  });
+  console.log('完了。次に rerunAll() ではなく triageInbox() を実行してください。');
 }

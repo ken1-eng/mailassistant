@@ -11,45 +11,57 @@ const SCHEDULE_QUESTIONS = [
   {
     name: 'has_schedule',
     type: 'noul',
-    question: 'このメールは日時の指定を伴う予定（会議、面談、訪問、イベントなど）の連絡か',
+    instructions: 'このメールは、日時の指定を伴う予定の連絡か。',
+    criteria: {
+      true: '会議、面談、訪問、打ち合わせ、イベントなどについて、日付や時刻が書かれている',
+      false: '予定に触れていない、または日時の手がかりが一切ない',
+    },
   },
   {
     name: 'i_participate',
     type: 'noul',
-    question:
-      '受信者本人がその予定に参加する立場か（他人同士の予定の共有や、参考として転送されただけのものは含まない）',
+    instructions: '受信者本人がその予定に参加する立場か。',
+    criteria: {
+      true: '受信者が招待されている、出席を求められている、または受信者自身が設定した予定',
+      false: '他人同士の予定の共有、参考として転送されただけ、全社向けの告知など',
+    },
   },
   {
     name: 'schedule_type',
     type: 'choice',
-    question: 'このメールの予定に関する連絡の種類はどれか',
+    instructions: 'このメールは予定について何を伝えているか。1つ選んでください。',
     // 「予定ではない」という棄権の選択肢を必ず入れる
     criteria: {
-      confirmed: '確定：日時が決まった予定の案内や招待',
-      proposal: '候補提示：日時の候補を挙げて都合を聞いている、または日程を調整しようとしている',
-      change: '変更連絡：既に決まっていた予定の日時や場所の変更',
-      cancel: '中止連絡：既に決まっていた予定の中止や延期（新しい日時は未定）',
-      not_schedule: '予定ではない：予定の連絡ではない、または判断できない',
+      confirmed: '日時が決まった予定の案内や招待',
+      proposal: '日時の候補を挙げて都合を聞いている、日程を調整しようとしている',
+      change: '既に決まっていた予定の日時や場所の変更',
+      cancel: '既に決まっていた予定の中止や延期（新しい日時は未定）',
+      not_schedule: '予定の連絡ではない、または判断できない',
     },
   },
 ];
 
+/** ⑤ の state は { existing_event, mail_event } の2つだけ。 */
 function sameEventQuestions_() {
   return [
     {
       name: 'is_same_event',
       type: 'noul',
-      question: '「既存の予定」と「メールの予定」は同一の予定を指しているか',
+      instructions: 'existing_event と mail_event は同一の予定を指しているか。',
+      criteria: {
+        true: '相手、目的、会議名などから同じ予定だと分かる。時刻が多少ずれていても、件名が簡略でもよい',
+        false: '時刻が重なっていても、相手や目的が違う別の予定',
+      },
     },
     {
       name: 'relation',
       type: 'choice',
-      question: '「メールの予定」は「既存の予定」に対してどういう関係か',
+      instructions: 'mail_event は existing_event に対してどういう関係か。1つ選んでください。',
       criteria: {
-        same: '同一：同じ予定で、日時も変わっていない',
-        rescheduled: '同一だが日時変更：同じ予定の日時が変わった',
-        cancelled: '同一だが中止：同じ予定が中止になった',
-        unrelated: '無関係：別の予定',
+        same: '同じ予定で、日時も変わっていない',
+        rescheduled: '同じ予定の日時が変わった',
+        cancelled: '同じ予定が中止になった',
+        unrelated: '別の予定',
         cannot_tell: '判断できない',
       },
     },
@@ -130,15 +142,11 @@ function act_(action, index, reason) {
 
 /** ⑤ に渡す state。無関係な情報を詰めると精度が落ちるので必要な項目だけにする。 */
 function sameEventState_(existing, extracted) {
-  const lines = [
-    '【既存の予定】',
-    '件名: ' + existing.title,
-    '日時: ' + existing.when,
-  ];
-  if (existing.location) lines.push('場所: ' + existing.location);
-  if (existing.description) lines.push('メモ: ' + existing.description.slice(0, 300));
-  lines.push('', '【メールの予定】', '件名: ' + (extracted.title || '(不明)'), '日時: ' + extracted.when);
-  if (extracted.location) lines.push('場所: ' + extracted.location);
-  if (extracted.mailSubject) lines.push('メール件名: ' + extracted.mailSubject);
-  return lines.join('\n');
+  const ev = { title: existing.title, when: existing.when };
+  if (existing.location) ev.location = existing.location;
+  if (existing.description) ev.memo = existing.description.slice(0, 300);
+  const mail = { title: extracted.title || '(不明)', when: extracted.when };
+  if (extracted.location) mail.location = extracted.location;
+  if (extracted.mailSubject) mail.mail_subject = extracted.mailSubject;
+  return { existing_event: ev, mail_event: mail };
 }

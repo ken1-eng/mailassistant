@@ -1,179 +1,223 @@
 /**
- * ① メール重要度分類（トリアージ）。
+ * ① メール重要度分類（トリアージ）。稼働中の既存スクリプトと同じ質問・採点。
  *
- * 「このメールは重要か」と一問で聞かず、事実ベースの小さな質問に割って
- * 重み付けはコード側に置く。社外判定と宛先人数はヘッダから分かるので Jev に聞かない。
- * 日付も Jev に扱わせない（「期限が書かれているか」だけを聞き、残り日数はコードで計算）。
+ * 重要な原則：
+ *   ×「このメールは重要か」と1問で聞く
+ *   ○ 事実ベースの小さな質問に割って、重み付けはコード側でやる
+ *
+ * Jevは日付の前後関係が苦手なので「期限が近いか」は絶対に聞かない。
+ * 「期限が書かれているか」だけ聞いて、近さの計算はコードでやる。
  */
 
 const TRIAGE_QUESTIONS = [
+  // --- Noul（yes/noの確率 0〜1。confidenceフィールドは無く、数値自体が確信度）---
   {
     name: 'needs_reply',
     type: 'noul',
-    question: 'このメールは受信者に返信や回答を求めているか',
+    instructions: 'このメールは受信者からの返信や回答を求めているか。',
+    criteria: {
+      true: '質問、依頼、確認、承認、日程調整など、受信者が何か返す必要がある',
+      false: '一方的な通知、報告、共有のみで返信は不要',
+    },
   },
   {
     name: 'has_deadline',
     type: 'noul',
-    question: 'このメールに対応の期限や締切の記述があるか',
+    instructions: '本文に、対応の期限や締切を示す記述があるか。',
+    criteria: {
+      true: '日付、曜日、「今日中」「明日まで」「今週中」などの期限の表現がある',
+      false: '期限に触れていない',
+    },
   },
   {
     name: 'addressed_to_me',
     type: 'noul',
-    question: '受信者本人が名指しで対応を求められているか（一斉送信の案内ではないか）',
+    instructions: '受信者本人が名指しで対応を求められているか。',
+    criteria: {
+      true: '宛名で指名されている、または明確に受信者の担当領域の依頼',
+      false: '一斉送信、CC止まり、誰宛とも書かれていない',
+    },
   },
   {
     name: 'involves_money',
     type: 'noul',
-    question: '業務上の金銭や契約に関わる内容か（私的な会費や割り勘は含まない）',
-  },
-  {
-    name: 'is_trouble',
-    type: 'noul',
-    question: '障害、クレーム、謝罪要求を含むか',
+    instructions: '業務上の金銭や契約に関わる内容か。個人的な会費や立替は含めない。',
+    criteria: {
+      true: '取引先との請求、見積、契約条件、支払い期日など、業務上の金銭のやりとり',
+      false: '金銭に触れていない、または懇親会の会費など私的な支払いのみ',
+    },
   },
   {
     name: 'is_personal',
     type: 'noul',
-    question: '業務ではなく私的な案内や連絡か（同期会、懇親会、個人的な誘いなど）',
+    instructions: '業務ではなく、私的な案内や連絡か。',
+    criteria: {
+      true: '同窓会、懇親会、季節の挨拶、個人的な近況など、仕事の遂行に関係しない',
+      false: '業務に関する連絡',
+    },
+  },
+  {
+    name: 'is_trouble',
+    type: 'noul',
+    instructions: '障害、クレーム、謝罪要求、トラブルの報告を含むか。',
+    criteria: {
+      true: '不具合、事故、苦情、抗議、謝罪の要求が書かれている',
+      false: '平常のやりとり',
+    },
   },
   {
     name: 'is_automated',
     type: 'noul',
-    question: '人ではなく機械が自動送信したメールか（通知、配信、システムメール）',
+    instructions: '機械が自動送信したメールか。',
+    criteria: {
+      true: 'システム通知、配信メール、広告、メールマガジン、自動応答',
+      false: '人間が書いて送っている',
+    },
   },
+
+  // --- Score（criteria は配列。先頭がレベル0。各段階は「程度」ではなく「状況」で書く）---
   {
     name: 'urgency',
     type: 'score',
-    question: 'このメールへの対応はどのくらい急ぐか',
-    // 各段階は「程度」ではなく「状況」で書く
+    instructions: '対応の緊急度を、書かれている状況から判断してください。',
     criteria: [
-      '対応不要、または期限の目安がない',
-      '1週間以上先までに対応すればよい',
-      '今週中に対応が必要',
+      '対応の必要がない、または読むだけでよい',
+      '対応は要るが、来週以降でも問題ない',
+      '数日以内に対応すればよい',
       '今日から明日のうちに対応が必要',
-      '今すぐ対応しないと損害やトラブルになる',
+      '今すぐ対応しないと業務や取引に実害が出る',
     ],
   },
+
+  // --- Choice（必ず「該当なし」の逃げ道を入れる）---
   {
     name: 'category',
     type: 'choice',
-    question: 'このメールの種類はどれか',
+    instructions: 'このメールの主な性質を1つ選んでください。',
     criteria: {
-      request: '依頼：受信者に作業や対応を依頼している',
-      scheduling: '日程調整：会議や面談の日時を決めようとしている',
-      contract: '契約：見積、発注、契約、請求に関する連絡',
-      trouble: 'トラブル：障害、クレーム、問題の報告',
-      info: '情報共有：報告や共有で、対応は求めていない',
-      sales: '営業：売り込み、宣伝、セミナー勧誘',
-      notification: '通知：システムやサービスからの自動通知',
-      other: 'その他：上のどれにも当てはまらない',
+      request: '依頼、質問、承認や判断の要求',
+      scheduling: '日程調整、会議の設定や変更',
+      contract: '契約、請求、見積、金銭に関するやりとり',
+      trouble: '障害、クレーム、トラブルの報告',
+      info: '情報共有、報告、議事録などの連絡',
+      sales: '売り込み、営業メール、勧誘',
+      notification: 'システム通知、配信、自動送信',
+      other: '上記のいずれにも当てはまらない、または判断できない',
     },
   },
 ];
 
 /**
- * 採点（0〜100点）。
- *
- * 緊急度は足し算ではなく掛け算。当初は40点満点の一項目にしていたが、
- * 緊急度ゼロのメールが他の加算で上位に来てしまった。
- * needs_reply は addressed_to_me で割り引く。一斉送信の案内でも出欠を求めれば
- * 返信は必要なので、足し算だと誰宛でもないメールが高得点になる。
+ * 採点（ここがコード側の仕事）。Jevは判断だけ返す。重み付け、日付計算、閾値はすべてこちら。
  *
  * @param {Object} a parseJevAnswers_ の結果
  * @param {{deadlineDays: ?number, isExternal: boolean}} meta コード側で求めた値
+ * @return {{bucket: string, score: number, category: string, categoryConf: number}}
  */
 function scoreTriage_(a, meta) {
-  const p = (k) => (a[k] === null || a[k] === undefined ? 0 : a[k]);
+  const noul = (k) => (typeof a[k] === 'number' ? a[k] : 0);
+  const urgencyRaw = a.urgency && typeof a.urgency.score === 'number' ? a.urgency.score : 0;
+  const urgencyConf = (a.urgency && a.urgency.confidence) || 0;
+  const category = (a.category && a.category.choice) || 'other';
+  const categoryConf = (a.category && a.category.confidence) || 0;
+  const result = (score) => ({
+    bucket: bucketFor_(score),
+    score: score,
+    category: category,
+    categoryConf: categoryConf,
+  });
 
-  if (p('is_automated') > 0.8) return 0;
-  const cat = a.category || {};
-  if (cat.choice === 'sales' && (cat.confidence || 0) > 0.7) return 0;
+  // 自動送信・営業は問答無用で落とす
+  if (noul('is_automated') > 0.8) return result(0);
+  if (category === 'sales' && categoryConf > 0.7) return result(0);
 
-  const ownership = 0.25 + 0.75 * p('addressed_to_me');
   let score = 0;
-  score += p('needs_reply') * ownership * 35;
-  score += p('is_trouble') * 20;
-  score += p('involves_money') * 15;
-  score += deadlinePoints_(p('has_deadline'), meta.deadlineDays);
-  score += meta.isExternal ? 5 : 0;
 
-  const u = a.urgency || {};
-  const urgency = u.score === null || u.score === undefined ? 0 : u.score;
-  const conf = u.confidence === null || u.confidence === undefined ? 1 : u.confidence;
-  const urgencyFactor = 0.25 + 0.75 * (urgency / 4) * Math.max(conf, 0.5);
+  // --- 重要度（誰の仕事か、何が懸かっているか）---
+  // 「返信が要る」は「自分が対応すべきか」で割り引く。
+  // 一斉送信の案内でも返信は要るので、足し算にすると効きすぎる。
+  const ownership = 0.25 + 0.75 * noul('addressed_to_me');
+  score += noul('needs_reply') * ownership * 35;
+  score += noul('is_trouble') * 20;
+  score += noul('involves_money') * 15;
+
+  // 期限の「近さ」はJevではなくコードで計算した値を使う。日付を特定できなければ加点しない
+  if (noul('has_deadline') > 0.5 && meta.deadlineDays !== null && meta.deadlineDays !== undefined) {
+    const days = meta.deadlineDays;
+    if (days <= 1) score += 25;
+    else if (days <= 3) score += 15;
+    else if (days <= 7) score += 7;
+    // 8日以上先は加点なし
+  }
+
+  if (meta.isExternal) score += 5;
+
+  // --- 緊急度は係数として効かせる ---
+  // 緊急度ゼロのメールは、他が何点でも上位に来てはいけない。
+  const urgencyNorm = Math.min(urgencyRaw / 4, 1);
+  const urgencyFactor = 0.25 + 0.75 * urgencyNorm * Math.max(urgencyConf, CONFIG.MIN_CONFIDENCE);
   score *= urgencyFactor;
 
-  score *= 1 - 0.6 * p('is_personal');
+  // 私信は業務メールと同じ土俵に乗せない
+  score *= 1 - 0.6 * noul('is_personal');
 
-  return Math.max(0, Math.min(100, Math.round(score)));
+  return result(Math.round(Math.min(score, 100)));
 }
 
-/** 期限の近さ（最大25点）。日数はコードで計算したもの。 */
-function deadlinePoints_(hasDeadline, days) {
-  if (hasDeadline < 0.5 || days === null || days === undefined) return 0;
-  let pts;
-  if (days < -1) pts = 0; // 大きく過ぎた日付は参考情報とみなす
-  else if (days <= 0) pts = 25;
-  else if (days <= 1) pts = 20;
-  else if (days <= 3) pts = 15;
-  else if (days <= 7) pts = 10;
-  else if (days <= 14) pts = 5;
-  else pts = 0;
-  return pts * hasDeadline;
-}
-
-function triageLabelFor_(score) {
-  if (score >= CONFIG.TRIAGE.THRESHOLD_HIGH) return CONFIG.TRIAGE.LABEL_HIGH;
-  if (score >= CONFIG.TRIAGE.THRESHOLD_MID) return CONFIG.TRIAGE.LABEL_MID;
-  return null; // 34点以下は無印。ラベルが付いている＝見るべきもの
+function bucketFor_(score) {
+  if (score >= CONFIG.THRESHOLD_HIGH) return 'HIGH';
+  if (score >= CONFIG.THRESHOLD_MEDIUM) return 'MEDIUM';
+  return 'LOW';
 }
 
 /**
- * 本文中の期限までの残り日数（日本時間の暦日ベース）。見つからなければ null。
+ * 本文から期限らしき日付を拾って、受信日（日本時間）からの残日数を返す。
+ * 見つからなければ null。ここをJevにやらせてはいけない。
  *
- * 年つき（2026/11/20）を先に探し、その部分を消してから年なし（11月20日）を探す。
+ * 年つき（2026/11/20）を先に試し、次に年なし（11月20日）を試す。
  * 逆にすると 2026/11/20 から 26/11 を拾って月=26になる。
- * 複数あるときは、昨日以降で最も近い日付を採る。
  */
-function daysUntilDeadline_(text, now) {
-  if (!text) return null;
-  const today = jstDayNumber_(now);
-  const todayYear = jstParts_(now).y;
-  const candidates = [];
+function daysUntilDeadline_(body, baseDate) {
+  const text = String(body || '').slice(0, 2000);
+  const p = jstParts_(baseDate);
+  const base = Date.UTC(p.y, p.m - 1, p.d);
 
-  const withYear = /(?<!\d)(\d{4})\s*[\/\-.年]\s*(\d{1,2})\s*[\/\-.月]\s*(\d{1,2})(?!\d)/g;
-  let rest = text.replace(withYear, (m, y, mo, d) => {
-    const dn = dayNumberOf_(Number(y), Number(mo), Number(d));
-    if (dn !== null) candidates.push(dn - today);
-    return ' ';
-  });
+  if (/本日中|今日中|至急|大至急/.test(text)) return 0;
+  if (/明日まで|翌営業日/.test(text)) return 1;
+  if (/今週中|週内/.test(text)) return Math.max(5 - new Date(base).getUTCDay(), 0);
 
-  const noYear = /(?<![\d\/\-.])(\d{1,2})\s*(?:\/|月)\s*(\d{1,2})(?![\d\/])/g;
-  let m;
-  while ((m = noYear.exec(rest)) !== null) {
-    const mo = Number(m[1]);
-    const d = Number(m[2]);
-    let dn = dayNumberOf_(todayYear, mo, d);
-    if (dn === null) continue;
-    // 12月に届いた「1/10締切」は翌年とみなす
-    if (dn - today < -60) dn = dayNumberOf_(todayYear + 1, mo, d);
-    if (dn !== null) candidates.push(dn - today);
+  let year = null;
+  let month;
+  let day;
+
+  // 先に「年つき」を試す: 2026/11/20, 2026-11-20, 2026年11月20日
+  let m = text.match(/(20\d{2})\s*[年\/\-\.]\s*(\d{1,2})\s*[月\/\-\.]\s*(\d{1,2})/);
+  if (m) {
+    year = parseInt(m[1], 10);
+    month = parseInt(m[2], 10) - 1;
+    day = parseInt(m[3], 10);
+  } else {
+    // 年なし: 11月20日, 11/20
+    // 直前が数字でないことを確認して「2026/11」のような誤検出を避ける
+    m = text.match(/(?:^|[^\d])(\d{1,2})\s*[月\/]\s*(\d{1,2})\s*日?(?![\d])/);
+    if (!m) return null;
+    month = parseInt(m[1], 10) - 1;
+    day = parseInt(m[2], 10);
   }
 
-  const upcoming = candidates.filter((x) => x >= -1).sort((x, y) => x - y);
-  return upcoming.length ? upcoming[0] : null;
+  if (month < 0 || month > 11 || day < 1 || day > 31) return null;
+
+  let target = Date.UTC(year !== null ? year : p.y, month, day);
+  if (year === null && target < base) {
+    target = Date.UTC(p.y + 1, month, day); // 年跨ぎ
+  }
+  return Math.round((target - base) / 86400000);
 }
 
 /** 日本時間の年月日。 */
 function jstParts_(date) {
   const t = new Date(date.getTime() + CONFIG.TZ_OFFSET_HOURS * 3600 * 1000);
   return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };
-}
-
-function jstDayNumber_(date) {
-  const p = jstParts_(date);
-  return Date.UTC(p.y, p.m - 1, p.d) / 86400000;
 }
 
 /** 実在しない日付（2/30、月=26 など）は null。 */
@@ -184,7 +228,7 @@ function dayNumberOf_(y, m, d) {
   return t.getTime() / 86400000;
 }
 
-/** 送信元が社外か。INTERNAL_DOMAINS 未設定だと全部社外扱いになる。 */
+/** 送信元が社外か。社内ドメインが未設定だと全部社外扱いになる。 */
 function isExternalSender_(from, domains) {
   const m = String(from || '').match(/@([A-Za-z0-9.\-]+)/);
   if (!m) return true;
@@ -192,10 +236,13 @@ function isExternalSender_(from, domains) {
   return !domains.some((d) => host === d || host.endsWith('.' + d));
 }
 
-/**
- * 最優先メールの別チャネル通知（Slack 等）のフック。
- * 未実装。必要になったらここに Webhook 呼び出しを書く。
- */
-function notifyUrgent_(mail, score) {
-  console.log(`[urgent] ${score}点 ${mail.subject} <${mail.from}>`);
+/** 最優先だけ別チャネルへ（Slack 等に飛ばすならここ）。まずはログだけ。 */
+function notifyUrgent_(mail, result) {
+  // const url = prop_('SLACK_WEBHOOK_URL');
+  // if (!url) return;
+  // UrlFetchApp.fetch(url, {
+  //   method: 'post', contentType: 'application/json',
+  //   payload: JSON.stringify({ text: '🔴 ' + mail.subject + '\n' + mail.from }),
+  // });
+  console.log(`🔴 要即対応: ${mail.subject}（${result.score}点）`);
 }

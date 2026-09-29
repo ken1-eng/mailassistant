@@ -1,19 +1,17 @@
 /**
  * Jev（TypeSafe System One）呼び出し。
  *
- * 質問は { name, type: 'noul' | 'score' | 'choice', question, criteria } で定義する。
+ * 質問はコード内では配列 [{ name, type, instructions, criteria }] で持ち、
+ * 送るときに質問名をキーにしたオブジェクトへ変換する（何問詰めても追加の待ち時間はほぼゼロ）。
+ *
  * criteria の書式は型ごとに違い、間違えると 422 が返る。
  *   Noul   : オブジェクト { "true": "…", "false": "…" }（省略可）
  *   Choice : オブジェクト { key: "説明", … }（最大255個）
  *   Score  : 配列 [ "…", "…" ]（2〜10段階、先頭がレベル0）
- *
- * エンドポイントとリクエストの外形はスクリプトプロパティ JEV_API_URL / JEV_API_KEY と
- * buildJevPayload_() に閉じ込めてある。既存トリアージスクリプトの呼び出し方と
- * 違う場合はここだけを直す。
  */
 
 function validateJevQuestion_(q) {
-  if (!q || !q.name || !q.question) throw new Error('Jev質問に name / question がない');
+  if (!q || !q.name || !q.instructions) throw new Error('Jev質問に name / instructions がない');
   const c = q.criteria;
   switch (q.type) {
     case 'noul':
@@ -40,26 +38,26 @@ function validateJevQuestion_(q) {
 }
 
 function buildJevPayload_(state, questions) {
-  questions.forEach(validateJevQuestion_);
-  return {
-    state: state,
-    questions: questions.map((q) => {
-      const out = { name: q.name, type: q.type, question: q.question };
-      if (q.criteria !== undefined) out.criteria = q.criteria;
-      return out;
-    }),
-  };
+  const qs = {};
+  questions.forEach((q) => {
+    validateJevQuestion_(q);
+    if (qs[q.name]) throw new Error(`質問名が重複: ${q.name}`);
+    const out = { type: q.type, instructions: q.instructions };
+    if (q.criteria !== undefined) out.criteria = q.criteria;
+    qs[q.name] = out;
+  });
+  return { state: state, model: JEV_MODEL, questions: qs };
 }
 
 /**
  * レスポンスの answers を型ごとに正規化する。
- *   noul   → 0〜1 の数値
+ *   noul   → 0〜1 の数値（Noul に confidence は無く、数値自体が確信度）
  *   score  → { score, confidence }（score は段階の加重平均なので小数）
  *   choice → { choice, confidence, probabilities }
- * 欠けている回答は null。呼び出し側で null を「判定なし」として扱う。
+ * 欠けている回答は null。
  */
-function parseJevAnswers_(response, questions) {
-  const answers = (response && response.answers) || {};
+function parseJevAnswers_(answers, questions) {
+  answers = answers || {};
   const out = {};
   questions.forEach((q) => {
     const a = answers[q.name];
@@ -90,27 +88,29 @@ function numOrNull_(v) {
   return v === null || v === undefined || v === '' || !Number.isFinite(n) ? null : n;
 }
 
+/**
+ * @param {string|Object} state 文字列でもオブジェクトでも渡せる
+ * @param {Array} questions
+ */
 function jevAsk_(state, questions) {
-  const url = prop_('JEV_API_URL');
-  const key = prop_('JEV_API_KEY');
-  if (!url || !key) throw new Error('スクリプトプロパティ JEV_API_URL / JEV_API_KEY が未設定');
+  const apiKey = prop_('TYPESAFE_API_KEY');
+  if (!apiKey) throw new Error('スクリプトプロパティ TYPESAFE_API_KEY が未設定です');
 
-  const payload = buildJevPayload_(state, questions);
   const options = {
     method: 'post',
     contentType: 'application/json',
-    headers: { Authorization: 'Bearer ' + key },
-    payload: JSON.stringify(payload),
+    headers: { Authorization: 'Bearer ' + apiKey },
+    payload: JSON.stringify(buildJevPayload_(state, questions)),
     muteHttpExceptions: true,
   };
 
   let res;
   for (let attempt = 0; attempt < 3; attempt++) {
-    res = UrlFetchApp.fetch(url, options);
+    res = UrlFetchApp.fetch(JEV_ENDPOINT, options);
     const code = res.getResponseCode();
-    if (code === 200) return parseJevAnswers_(JSON.parse(res.getContentText()), questions);
-    if (code !== 429 && code < 500) break; // 422 など書式エラーは再試行しても直らない
-    Utilities.sleep(1000 * Math.pow(2, attempt));
+    if (code === 200) return parseJevAnswers_(JSON.parse(res.getContentText()).answers, questions);
+    if (code !== 429 && code !== 503) break; // 422 など書式エラーは再試行しても直らない
+    Utilities.sleep(2000 * Math.pow(2, attempt));
   }
-  throw new Error(`Jev ${res.getResponseCode()}: ${res.getContentText().slice(0, 500)}`);
+  throw new Error('Jev API ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
 }

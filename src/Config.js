@@ -1,21 +1,57 @@
 /**
  * 設定値。
  *
- * 秘密情報や環境ごとに変わる値はスクリプトプロパティに置く（README参照）。
- * ここにあるのはコードと一緒にレビューされるべき値（閾値・上限・ラベル名）。
+ * ① トリアージの値とスクリプトプロパティ名は、稼働中の既存スクリプト（gmail-triage-jev.gs）と
+ * 同じにしてある。同じ Apps Script プロジェクトに入れ替えれば、開始日・日次カウント・ログシートを
+ * そのまま引き継ぐ。
+ *
+ * スクリプトプロパティ
+ *   TYPESAFE_API_KEY   Jev の API キー（必須）
+ *   START_DATE         開始日 yyyy/MM/dd。setup() が入れる
+ *   DAILY_COUNT        1日あたり上限のカウンタ（JSON）
+ *   LOG_SHEET_ID       判定ログのスプレッドシート。setup() が作る
+ *   INTERNAL_DOMAINS   社内ドメイン（カンマ区切り）。CONFIG.INTERNAL_DOMAINS より優先
+ *   CAL_STAGE          カレンダー登録の段階 0〜5。既定 0（トリアージのみ）
+ *   ANTHROPIC_API_KEY  ③ 抽出用（段階2以上で必須）
+ *   CLAUDE_MODEL       ③ のモデル。既定 claude-opus-5-5
+ *   NOTIFY_EMAIL       「通知のみ」を送るアドレス。未設定ならログのみ
+ *
  * 閾値はすべて暫定値。ログシートの「自己判定」列を埋めて分布を見てから決める。
  */
 const CONFIG = {
-  TRIAGE: {
-    THRESHOLD_HIGH: 65, // 以上で 01_即対応
-    THRESHOLD_MID: 35, // 以上で 02_今日中。未満は無印
-    LABEL_HIGH: '01_即対応',
-    LABEL_MID: '02_今日中',
-    MARKER: '_jev',
+  // 何を拾うか（Gmail検索クエリ）。after: は開始日から自動で付ける
+  TRIAGE_QUERY: 'is:unread -category:promotions -category:social',
+  // 予定判定は既読でも拾う（予定の見落としを避ける。二重処理は _cal マーカーで防ぐ）
+  CAL_QUERY: '-category:promotions -category:social -in:chats -in:drafts',
+
+  MAX_PER_DAY: 100, // 溜まった未読を一気に舐めないための保険
+  MAX_THREADS: 20, // 1回の実行で処理する最大スレッド数（Apps Script は6分で強制終了する）
+  RUN_TIME_BUDGET_MS: 4.5 * 60 * 1000,
+
+  // 自分の社内ドメイン（@は付けない）。スクリプトプロパティ INTERNAL_DOMAINS があればそちらを使う
+  INTERNAL_DOMAINS: [],
+
+  // 本文をどこまで送るか（文字数）。長文を全部送っても精度は上がらず金だけ増える
+  BODY_LIMIT: 3000,
+
+  // LOW（あとで）はラベルを付けない。ラベルが付いている＝見るべきもの
+  LABELS: {
+    HIGH: '01_即対応',
+    MEDIUM: '02_今日中',
+    PROCESSED: '_jev', // 二重処理を防ぐための内部用マーカー
+    CAL_PROCESSED: '_cal', // 予定判定済み。トリアージだけ済んだ状態を区別する
   },
 
+  THRESHOLD_HIGH: 65,
+  THRESHOLD_MEDIUM: 35,
+
+  // これ未満の確信度の判定は「不明」として弱く扱う
+  MIN_CONFIDENCE: 0.5,
+
+  LOG_SHEET_NAME: 'Jevメール判定ログ',
+  CAL_LOG_SHEET_NAME: '予定登録ログ', // 同じスプレッドシートの別シート
+
   CAL: {
-    MARKER: '_cal', // トリアージの _jev とは別。予定判定だけ未実施の状態を区別する
     PROVISIONAL_CALENDAR: 'Jev仮登録',
     MATCH_WINDOW_HOURS: 3, // ④ 候補時刻の前後何時間を照合するか
     DEFAULT_DURATION_MIN: 60, // 終了時刻が書かれていないときの長さ
@@ -29,25 +65,15 @@ const CONFIG = {
     },
   },
 
-  LIMITS: {
-    PER_RUN: 20, // Apps Script の6分制限
-    PER_DAY: 100, // 暴走を止める
-    BODY_CHARS: 3000,
-    RUN_TIME_BUDGET_MS: 4.5 * 60 * 1000,
-  },
-
-  LOG: {
-    TRIAGE_SHEET: 'triage_log',
-    CAL_SHEET: 'calendar_log',
-  },
-
   TRIGGER_MINUTES: 5,
   TZ_OFFSET_HOURS: 9, // 日付計算は日本時間固定（夏時間なし）
 };
 
+const JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';
+const JEV_MODEL = 'jev-latest';
+
 /**
  * カレンダー登録の段階（要件定義「実装順序と受け入れ条件」に対応）。
- * スクリプトプロパティ CAL_STAGE で切り替える。
  */
 const CAL_STAGE = {
   OFF: 0,
@@ -73,8 +99,7 @@ function calStage_() {
 }
 
 function internalDomains_() {
-  return String(prop_('INTERNAL_DOMAINS', ''))
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+  const p = prop_('INTERNAL_DOMAINS', '');
+  const list = p ? p.split(',') : CONFIG.INTERNAL_DOMAINS;
+  return list.map((s) => String(s).trim().toLowerCase()).filter(Boolean);
 }

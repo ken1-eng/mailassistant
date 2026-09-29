@@ -1,32 +1,16 @@
 /**
- * 判定ログ（スプレッドシート）。
+ * 判定ログ（スプレッドシート）。全判定を残す。これが検証の土台になる。
  *
- * 「自己判定」列は手で埋める。自分の感覚とシステムの判定のズレがそのまま教師データになり、
- * 閾値はこの分布を見てから決める。
+ * トリアージのログは既存スクリプトと同じスプレッドシート（LOG_SHEET_ID）の先頭シートに、
+ * 同じ列で書く。予定登録のログは同じスプレッドシートの別シートに書く。
+ *
+ * 「自己判定」列を手で埋めていくと、自分の感覚とシステムの判定のズレがそのまま教師データになる。
  */
 
-const TRIAGE_LOG_HEADERS = [
-  '記録日時',
-  'モード',
-  '受信日時',
-  '送信者',
-  '件名',
-  '自己判定（高/中/低）',
-  'スコア',
-  'ラベル',
-  '社外',
-  '期限まで日数',
-  'needs_reply',
-  'has_deadline',
-  'addressed_to_me',
-  'involves_money',
-  'is_trouble',
-  'is_personal',
-  'is_automated',
-  'urgency',
-  'category',
-  '宛先人数',
-  'messageId',
+const LOG_HEADERS = [
+  '受信日時', '送信者', '件名', 'スコア', '判定', '自己判定',
+  '分類', '分類確信度', '緊急度', '緊急度確信度', '期限日数',
+  '要返信', '名指し', '期限あり', '金銭', 'トラブル', '私信', '自動送信',
 ];
 
 const CAL_LOG_HEADERS = [
@@ -50,75 +34,83 @@ const CAL_LOG_HEADERS = [
   'messageId',
 ];
 
-function logSpreadsheet_(createIfMissing) {
-  const id = prop_('LOG_SPREADSHEET_ID');
-  if (id) return SpreadsheetApp.openById(id);
-  if (!createIfMissing) throw new Error('LOG_SPREADSHEET_ID が未設定。setup() を実行する');
-  const ss = SpreadsheetApp.create('Jev メール判定ログ');
-  setProp_('LOG_SPREADSHEET_ID', ss.getId());
+function logSpreadsheet_() {
+  const id = prop_('LOG_SHEET_ID');
+  if (id) {
+    try {
+      return SpreadsheetApp.openById(id);
+    } catch (e) {
+      /* 消されていたら作り直す */
+    }
+  }
+  const ss = SpreadsheetApp.create(CONFIG.LOG_SHEET_NAME);
+  const sheet = ss.getSheets()[0];
+  sheet.appendRow(LOG_HEADERS);
+  sheet.getRange(1, 1, 1, LOG_HEADERS.length).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  setProp_('LOG_SHEET_ID', ss.getId());
+  console.log('ログシートを作成しました: ' + ss.getUrl());
   return ss;
 }
 
-function logSheet_(name, headers) {
-  const ss = logSpreadsheet_(false);
-  let sh = ss.getSheetByName(name);
+function getLogSheet_() {
+  return logSpreadsheet_().getSheets()[0];
+}
+
+function getCalLogSheet_() {
+  const ss = logSpreadsheet_();
+  let sh = ss.getSheetByName(CONFIG.CAL_LOG_SHEET_NAME);
   if (!sh) {
-    sh = ss.insertSheet(name);
-    sh.appendRow(headers);
+    // 末尾に追加する。先頭シートはトリアージのログのまま
+    sh = ss.insertSheet(CONFIG.CAL_LOG_SHEET_NAME, ss.getSheets().length);
+    sh.appendRow(CAL_LOG_HEADERS);
+    sh.getRange(1, 1, 1, CAL_LOG_HEADERS.length).setFontWeight('bold');
     sh.setFrozenRows(1);
   }
   return sh;
 }
 
-function fmtNum_(v) {
-  return v === null || v === undefined ? '' : Math.round(v * 100) / 100;
+function r2_(v) {
+  return typeof v === 'number' ? Math.round(v * 100) / 100 : '';
 }
 
 function fmtChoice_(c) {
   if (!c || c.choice === null || c.choice === undefined) return '';
-  return c.confidence === null || c.confidence === undefined ? c.choice : `${c.choice} (${fmtNum_(c.confidence)})`;
+  return typeof c.confidence === 'number' ? `${c.choice} (${r2_(c.confidence)})` : c.choice;
 }
 
-function fmtScore_(s) {
-  if (!s || s.score === null || s.score === undefined) return '';
-  return s.confidence === null || s.confidence === undefined ? fmtNum_(s.score) : `${fmtNum_(s.score)} (${fmtNum_(s.confidence)})`;
-}
-
-function logTriage_(mode, mail, a, r) {
-  logSheet_(CONFIG.LOG.TRIAGE_SHEET, TRIAGE_LOG_HEADERS).appendRow([
-    new Date(),
-    mode,
+function logToSheet_(mail, a, result) {
+  getLogSheet_().appendRow([
     mail.date,
     mail.from,
     mail.subject,
-    '',
-    r.score,
-    r.label || '',
-    r.isExternal ? '社外' : '社内',
-    r.deadlineDays === null ? '' : r.deadlineDays,
-    fmtNum_(a.needs_reply),
-    fmtNum_(a.has_deadline),
-    fmtNum_(a.addressed_to_me),
-    fmtNum_(a.involves_money),
-    fmtNum_(a.is_trouble),
-    fmtNum_(a.is_personal),
-    fmtNum_(a.is_automated),
-    fmtScore_(a.urgency),
-    fmtChoice_(a.category),
-    mail.recipientCount,
-    mail.id,
+    result.score,
+    result.bucket,
+    '', // 自己判定：ここは手で埋める
+    result.category || '',
+    r2_(result.categoryConf),
+    r2_(a.urgency && a.urgency.score),
+    r2_(a.urgency && a.urgency.confidence),
+    result.deadlineDays === null || result.deadlineDays === undefined ? '' : result.deadlineDays,
+    r2_(a.needs_reply),
+    r2_(a.addressed_to_me),
+    r2_(a.has_deadline),
+    r2_(a.involves_money),
+    r2_(a.is_trouble),
+    r2_(a.is_personal),
+    r2_(a.is_automated),
   ]);
 }
 
 function logCalendar_(mode, mail, a, row) {
-  logSheet_(CONFIG.LOG.CAL_SHEET, CAL_LOG_HEADERS).appendRow([
+  getCalLogSheet_().appendRow([
     new Date(),
     mode,
     mail.date,
     mail.from,
     mail.subject,
-    fmtNum_(a.has_schedule),
-    fmtNum_(a.i_participate),
+    r2_(a.has_schedule),
+    r2_(a.i_participate),
     fmtChoice_(a.schedule_type),
     row.ev ? formatJst_(row.ev.start, row.ev.allDay) : '',
     row.ev ? row.ev.title : '',
@@ -128,7 +120,13 @@ function logCalendar_(mode, mail, a, row) {
     row.action,
     row.reason || '',
     row.note || '',
-    '',
+    '', // 自己判定：ここは手で埋める
     mail.id,
   ]);
+}
+
+/** ログシートのURLを表示する */
+function showLogSheet() {
+  const id = prop_('LOG_SHEET_ID');
+  console.log(id ? SpreadsheetApp.openById(id).getUrl() : 'まだ作成されていません');
 }
