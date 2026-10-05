@@ -5,6 +5,7 @@
  *   triageInbox()     トリガーから呼ばれる本処理
  *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
  *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
+ *   renameLabels()    旧ラベル（即対応・今日中）を新ラベル（緊急・要対応）に移す
  *   explainMail()     EXPLAIN_QUERY に一致するメールが、なぜその判定になったかを見る
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
@@ -544,6 +545,27 @@ function rerunAll() {
     levels.forEach((l) => t.removeLabel(l));
   });
   console.log(`${threads.length} 件の判定をリセットしました`);
+}
+
+/**
+ * ラベル名を変えたあとに一度だけ実行する（01_即対応 → 01_緊急、02_今日中 → 02_要対応）。
+ * 旧ラベルの付いたスレッドに新ラベルを付け、旧ラベルを削除する。メール本体には影響しない。
+ * 新しいラベルの色は Gmail の画面で付け直す。
+ */
+function renameLabels() {
+  Object.keys(CONFIG.OLD_LABELS).forEach((oldName) => {
+    const old = GmailApp.getUserLabelByName(oldName);
+    if (!old) return;
+    const neu = label_(CONFIG.OLD_LABELS[oldName]);
+    let moved = 0;
+    for (let threads = old.getThreads(0, 100); threads.length; threads = old.getThreads(0, 100)) {
+      neu.addToThreads(threads);
+      old.removeFromThreads(threads);
+      moved += threads.length;
+    }
+    old.deleteLabel();
+    console.log(`${oldName} → ${CONFIG.OLD_LABELS[oldName]}: ${moved} スレッドを移しました`);
+  });
 }
 
 /**

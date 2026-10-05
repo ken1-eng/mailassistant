@@ -81,9 +81,15 @@ test('scoreTriage_: 期限の加点は has_deadline > 0.5 のときだけ（25 /
   assert.equal(g.scoreTriage_(answers({ has_deadline: 0.5, urgency: base.urgency }), { deadlineDays: 0 }).score, 0);
 });
 
-test('scoreTriage_: 緊急度ゼロは他が高くても上位に来ない（掛け算）', () => {
-  const a = answers({ needs_reply: 1, addressed_to_me: 1, involves_money: 1, is_trouble: 1 });
-  assert.equal(g.scoreTriage_(a, { deadlineDays: null, isExternal: true }).bucket, 'LOW');
+test('scoreTriage_: 緊急度ゼロは他が高くても緊急にならない（掛け算）', () => {
+  const meta = { deadlineDays: null, isExternal: true };
+  // 名指しの依頼でなければ無印
+  const broadcast = g.scoreTriage_(answers({ needs_reply: 1, addressed_to_me: 0, involves_money: 1, is_trouble: 1 }), meta);
+  assert.equal(broadcast.bucket, 'LOW');
+  // 名指しの依頼は要対応止まり（緊急にはならない）
+  const direct = g.scoreTriage_(answers({ needs_reply: 1, addressed_to_me: 1, involves_money: 1, is_trouble: 1 }), meta);
+  assert.ok(direct.score < g.CONFIG.THRESHOLD_MEDIUM, `score=${direct.score}`);
+  assert.equal(direct.bucket, 'MEDIUM');
 });
 
 test('scoreTriage_: 緊急度の確信度は最低 0.5 として効かせる', () => {
@@ -116,4 +122,38 @@ test('isExternalSender_: 社内ドメインとサブドメイン', () => {
   assert.equal(g.isExternalSender_('a@mail.example.co.jp', d), false);
   assert.equal(g.isExternalSender_('a@other.com', d), true);
   assert.equal(g.isExternalSender_('a@example.co.jp', []), true); // 未設定なら全部社外
+});
+
+test('名指しの依頼は急ぎでなくても「要対応」（Third Bridge の実データ）', () => {
+  const a = answers({
+    needs_reply: 0.98,
+    addressed_to_me: 0.97,
+    has_deadline: 0.12,
+    involves_money: 0.08,
+    is_trouble: 0.02,
+    is_personal: 0.02,
+    is_automated: 0.25,
+    urgency: { score: 1.69, confidence: 0.64 },
+    category: { choice: 'request', confidence: 0.66 },
+  });
+  const r = g.scoreTriage_(a, { deadlineDays: null, isExternal: true });
+  assert.equal(r.score, 18); // 点数は変えない（ログと比較できるように）
+  assert.equal(r.bucket, 'MEDIUM');
+});
+
+test('名指しでない依頼・自動送信・営業は引き上げない', () => {
+  const u = { score: 1, confidence: 0.6 };
+  // 一斉案内（同期会の案内の実データ相当）
+  assert.equal(g.scoreTriage_(answers({ needs_reply: 0.97, addressed_to_me: 0.15, urgency: u }), META).bucket, 'LOW');
+  assert.equal(
+    g.scoreTriage_(answers({ needs_reply: 0.9, addressed_to_me: 0.9, is_automated: 0.9, urgency: u }), META).bucket,
+    'LOW'
+  );
+  const sales = { needs_reply: 0.9, addressed_to_me: 0.9, category: { choice: 'sales', confidence: 0.8 }, urgency: u };
+  assert.equal(g.scoreTriage_(answers(sales), META).bucket, 'LOW');
+});
+
+test('名指しの依頼でも急ぎなら「緊急」のまま', () => {
+  const a = answers({ needs_reply: 1, addressed_to_me: 1, has_deadline: 1, urgency: { score: 4, confidence: 1 } });
+  assert.equal(g.scoreTriage_(a, { deadlineDays: 0, isExternal: true }).bucket, 'HIGH');
 });

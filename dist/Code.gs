@@ -43,16 +43,25 @@ const CONFIG = {
   // 本文をどこまで送るか（文字数）。長文を全部送っても精度は上がらず金だけ増える
   BODY_LIMIT: 3000,
 
-  // LOW（あとで）はラベルを付けない。ラベルが付いている＝見るべきもの
+  // 緊急・要対応・それ以外の3段階。それ以外（LOW）はラベルを付けない。ラベルが付いている＝見るべきもの
+  //   HIGH   01_緊急   対応が必要で急ぐ（65点以上）
+  //   MEDIUM 02_要対応 自分が対応すべき。急ぎかは問わない（35点以上、または名指しの依頼）
   LABELS: {
-    HIGH: '01_即対応',
-    MEDIUM: '02_今日中',
+    HIGH: '01_緊急',
+    MEDIUM: '02_要対応',
     PROCESSED: '_jev', // 二重処理を防ぐための内部用マーカー
     CAL_PROCESSED: '_cal', // 予定判定済み。トリアージだけ済んだ状態を区別する
   },
 
   THRESHOLD_HIGH: 65,
   THRESHOLD_MEDIUM: 35,
+
+  // 名指しの依頼（要返信も名指しもこれ以上）は、急ぎでなくても少なくとも「要対応」にする。
+  // 緊急度を掛け算にしているため、急ぎでない名指しの依頼は点数だけでは 35 点に届かない
+  DIRECT_REQUEST: 0.8,
+
+  // ラベル名を変えたときに移し替える対応表（renameLabels() で使う）
+  OLD_LABELS: { '01_即対応': '01_緊急', '02_今日中': '02_要対応' },
 
   // これ未満の確信度の判定は「不明」として弱く扱う
   MIN_CONFIDENCE: 0.5,
@@ -361,8 +370,8 @@ function scoreTriage_(a, meta) {
   const categoryConf = (a.category && a.category.confidence) || 0;
   // parts は採点の内訳。explainMail() で「なぜこの点数か」を見るために残す
   const parts = [];
-  const result = (score) => ({
-    bucket: bucketFor_(score),
+  const result = (score, bucket) => ({
+    bucket: bucket || bucketFor_(score),
     score: score,
     category: category,
     categoryConf: categoryConf,
@@ -424,7 +433,16 @@ function scoreTriage_(a, meta) {
   if (noul('is_personal') > 0) parts.push(`私信の割引 ×${r((1 - 0.6 * noul('is_personal')) * 100) / 100}`);
   score *= 1 - 0.6 * noul('is_personal');
 
-  return result(Math.round(Math.min(score, 100)));
+  score = Math.round(Math.min(score, 100));
+
+  // 名指しの依頼は、点数が届かなくても「要対応」にする（緊急かどうかは点数で決める）
+  const direct =
+    noul('needs_reply') >= CONFIG.DIRECT_REQUEST && noul('addressed_to_me') >= CONFIG.DIRECT_REQUEST;
+  if (direct && bucketFor_(score) === 'LOW') {
+    parts.push(`名指しの依頼（要返信=${r(noul('needs_reply'))}, 名指し=${r(noul('addressed_to_me'))}）→ 要対応`);
+    return result(score, 'MEDIUM');
+  }
+  return result(score);
 }
 
 function bucketFor_(score) {
@@ -507,7 +525,7 @@ function notifyUrgent_(mail, result) {
   //   method: 'post', contentType: 'application/json',
   //   payload: JSON.stringify({ text: '🔴 ' + mail.subject + '\n' + mail.from }),
   // });
-  console.log(`🔴 要即対応: ${mail.subject}（${result.score}点）`);
+  console.log(`🔴 緊急: ${mail.subject}（${result.score}点）`);
 }
 
 
@@ -1244,6 +1262,7 @@ function showLogSheet() {
  *   triageInbox()     トリガーから呼ばれる本処理
  *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
  *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
+ *   renameLabels()    旧ラベル（即対応・今日中）を新ラベル（緊急・要対応）に移す
  *   explainMail()     EXPLAIN_QUERY に一致するメールが、なぜその判定になったかを見る
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
@@ -1783,6 +1802,27 @@ function rerunAll() {
     levels.forEach((l) => t.removeLabel(l));
   });
   console.log(`${threads.length} 件の判定をリセットしました`);
+}
+
+/**
+ * ラベル名を変えたあとに一度だけ実行する（01_即対応 → 01_緊急、02_今日中 → 02_要対応）。
+ * 旧ラベルの付いたスレッドに新ラベルを付け、旧ラベルを削除する。メール本体には影響しない。
+ * 新しいラベルの色は Gmail の画面で付け直す。
+ */
+function renameLabels() {
+  Object.keys(CONFIG.OLD_LABELS).forEach((oldName) => {
+    const old = GmailApp.getUserLabelByName(oldName);
+    if (!old) return;
+    const neu = label_(CONFIG.OLD_LABELS[oldName]);
+    let moved = 0;
+    for (let threads = old.getThreads(0, 100); threads.length; threads = old.getThreads(0, 100)) {
+      neu.addToThreads(threads);
+      old.removeFromThreads(threads);
+      moved += threads.length;
+    }
+    old.deleteLabel();
+    console.log(`${oldName} → ${CONFIG.OLD_LABELS[oldName]}: ${moved} スレッドを移しました`);
+  });
 }
 
 /**

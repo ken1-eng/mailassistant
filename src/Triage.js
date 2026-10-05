@@ -122,8 +122,8 @@ function scoreTriage_(a, meta) {
   const categoryConf = (a.category && a.category.confidence) || 0;
   // parts は採点の内訳。explainMail() で「なぜこの点数か」を見るために残す
   const parts = [];
-  const result = (score) => ({
-    bucket: bucketFor_(score),
+  const result = (score, bucket) => ({
+    bucket: bucket || bucketFor_(score),
     score: score,
     category: category,
     categoryConf: categoryConf,
@@ -185,7 +185,16 @@ function scoreTriage_(a, meta) {
   if (noul('is_personal') > 0) parts.push(`私信の割引 ×${r((1 - 0.6 * noul('is_personal')) * 100) / 100}`);
   score *= 1 - 0.6 * noul('is_personal');
 
-  return result(Math.round(Math.min(score, 100)));
+  score = Math.round(Math.min(score, 100));
+
+  // 名指しの依頼は、点数が届かなくても「要対応」にする（緊急かどうかは点数で決める）
+  const direct =
+    noul('needs_reply') >= CONFIG.DIRECT_REQUEST && noul('addressed_to_me') >= CONFIG.DIRECT_REQUEST;
+  if (direct && bucketFor_(score) === 'LOW') {
+    parts.push(`名指しの依頼（要返信=${r(noul('needs_reply'))}, 名指し=${r(noul('addressed_to_me'))}）→ 要対応`);
+    return result(score, 'MEDIUM');
+  }
+  return result(score);
 }
 
 function bucketFor_(score) {
@@ -268,5 +277,5 @@ function notifyUrgent_(mail, result) {
   //   method: 'post', contentType: 'application/json',
   //   payload: JSON.stringify({ text: '🔴 ' + mail.subject + '\n' + mail.from }),
   // });
-  console.log(`🔴 要即対応: ${mail.subject}（${result.score}点）`);
+  console.log(`🔴 緊急: ${mail.subject}（${result.score}点）`);
 }
