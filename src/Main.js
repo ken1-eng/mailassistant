@@ -6,6 +6,7 @@
  *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
  *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
  *   renameLabels()    旧ラベル（即対応・今日中）を新ラベル（緊急・要対応）に移す
+ *   retriageMail()    EXPLAIN_QUERY に一致するメールをトリアージし直してラベルを付け直す
  *   explainMail()     EXPLAIN_QUERY に一致するメールが、なぜその判定になったかを見る
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
@@ -206,6 +207,30 @@ function explainMail() {
     console.log(
       `  Jev: 名指し=${r2_(a.addressed_to_me)} 私信=${r2_(a.is_personal)} 自動送信=${r2_(a.is_automated)} 分類=${fmtChoice_(a.category)}`
     );
+  });
+}
+
+/**
+ * EXPLAIN_QUERY に一致するメールを、既読かどうか・_jev の有無に関係なくトリアージし直してラベルを付ける。
+ * 採点ルールを変えたあと、特定のメールだけ付け直したいときに使う（最大3スレッド）。
+ * 古い重要度ラベルは外してから付け直す。
+ */
+function retriageMail() {
+  const query = prop_('EXPLAIN_QUERY');
+  if (!query) {
+    console.log('スクリプトプロパティ EXPLAIN_QUERY に検索条件を入れてください（例: subject:"Third Bridge"）');
+    return;
+  }
+  const threads = GmailApp.search(query, 0, 3);
+  if (!threads.length) {
+    console.log(`「${query}」に一致するメールがありません`);
+    return;
+  }
+  const ctx = { dry: false, stage: CAL_STAGE.OFF, me: myAddresses_(), domains: internalDomains_(), ranking: [] };
+  const levels = [CONFIG.LABELS.HIGH, CONFIG.LABELS.MEDIUM].map(label_);
+  threads.forEach((thread) => {
+    levels.forEach((l) => thread.removeLabel(l));
+    processThread_({ thread: thread, needTriage: true, needCal: false }, ctx);
   });
 }
 
