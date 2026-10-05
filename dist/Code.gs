@@ -359,16 +359,26 @@ function scoreTriage_(a, meta) {
   const urgencyConf = (a.urgency && a.urgency.confidence) || 0;
   const category = (a.category && a.category.choice) || 'other';
   const categoryConf = (a.category && a.category.confidence) || 0;
+  // parts は採点の内訳。explainMail() で「なぜこの点数か」を見るために残す
+  const parts = [];
   const result = (score) => ({
     bucket: bucketFor_(score),
     score: score,
     category: category,
     categoryConf: categoryConf,
+    parts: parts,
   });
+  const r = (v) => Math.round(v * 10) / 10;
 
   // 自動送信・営業は問答無用で落とす
-  if (noul('is_automated') > 0.8) return result(0);
-  if (category === 'sales' && categoryConf > 0.7) return result(0);
+  if (noul('is_automated') > 0.8) {
+    parts.push(`即0点: 自動送信 is_automated=${r(noul('is_automated'))} > 0.8`);
+    return result(0);
+  }
+  if (category === 'sales' && categoryConf > 0.7) {
+    parts.push(`即0点: 営業 category=sales (${r(categoryConf)}) > 0.7`);
+    return result(0);
+  }
 
   let score = 0;
 
@@ -376,28 +386,42 @@ function scoreTriage_(a, meta) {
   // 「返信が要る」は「自分が対応すべきか」で割り引く。
   // 一斉送信の案内でも返信は要るので、足し算にすると効きすぎる。
   const ownership = 0.25 + 0.75 * noul('addressed_to_me');
-  score += noul('needs_reply') * ownership * 35;
+  const reply = noul('needs_reply') * ownership * 35;
+  score += reply;
+  parts.push(`要返信 ${r(reply)}/35（needs_reply=${r(noul('needs_reply'))} × 名指し係数 ${r(ownership)}）`);
   score += noul('is_trouble') * 20;
+  parts.push(`トラブル ${r(noul('is_trouble') * 20)}/20`);
   score += noul('involves_money') * 15;
+  parts.push(`金銭 ${r(noul('involves_money') * 15)}/15`);
 
   // 期限の「近さ」はJevではなくコードで計算した値を使う。日付を特定できなければ加点しない
+  let deadline = 0;
   if (noul('has_deadline') > 0.5 && meta.deadlineDays !== null && meta.deadlineDays !== undefined) {
     const days = meta.deadlineDays;
-    if (days <= 1) score += 25;
-    else if (days <= 3) score += 15;
-    else if (days <= 7) score += 7;
+    if (days <= 1) deadline = 25;
+    else if (days <= 3) deadline = 15;
+    else if (days <= 7) deadline = 7;
     // 8日以上先は加点なし
   }
+  score += deadline;
+  parts.push(
+    `期限 ${deadline}/25（has_deadline=${r(noul('has_deadline'))}, 残り日数=${
+      meta.deadlineDays === null || meta.deadlineDays === undefined ? '特定できず' : meta.deadlineDays
+    }）`
+  );
 
   if (meta.isExternal) score += 5;
+  parts.push(`社外 ${meta.isExternal ? 5 : 0}/5`);
 
   // --- 緊急度は係数として効かせる ---
   // 緊急度ゼロのメールは、他が何点でも上位に来てはいけない。
   const urgencyNorm = Math.min(urgencyRaw / 4, 1);
   const urgencyFactor = 0.25 + 0.75 * urgencyNorm * Math.max(urgencyConf, CONFIG.MIN_CONFIDENCE);
+  parts.push(`小計 ${r(score)} × 緊急度係数 ${r(urgencyFactor * 100) / 100}（urgency=${r(urgencyRaw)}/4, 確信度=${r(urgencyConf)}）`);
   score *= urgencyFactor;
 
   // 私信は業務メールと同じ土俵に乗せない
+  if (noul('is_personal') > 0) parts.push(`私信の割引 ×${r((1 - 0.6 * noul('is_personal')) * 100) / 100}`);
   score *= 1 - 0.6 * noul('is_personal');
 
   return result(Math.round(Math.min(score, 100)));
@@ -1220,6 +1244,7 @@ function showLogSheet() {
  *   triageInbox()     トリガーから呼ばれる本処理
  *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
  *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
+ *   explainMail()     EXPLAIN_QUERY に一致するメールが、なぜその判定になったかを見る
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
  *   resetDailyCount() 1日あたり上限のカウントをリセットする
@@ -1362,6 +1387,64 @@ function previewLine_(mail, row) {
   parts.push(PREVIEW_REASONS[row.reason] || row.reason || '');
   if (row.note) parts.push(row.note);
   return parts.filter(Boolean).join(' | ');
+}
+
+/**
+ * 1通のメールが「なぜラベルが付かなかったか」を調べる。
+ * スクリプトプロパティ EXPLAIN_QUERY に Gmail の検索条件（例: subject:"Third Bridge"）を入れて実行する。
+ * 1. 処理対象に入っていたか（開始日・プロモーション/ソーシャル・既読・マーカー）
+ * 2. Jev にもう一度聞いて採点の内訳を出す（ラベルもログも書かない。Jev を1回呼ぶ）
+ */
+function explainMail() {
+  const query = prop_('EXPLAIN_QUERY');
+  if (!query) {
+    console.log('スクリプトプロパティ EXPLAIN_QUERY に検索条件を入れてください（例: subject:"Third Bridge"）');
+    return;
+  }
+  const threads = GmailApp.search(query, 0, 3);
+  if (!threads.length) {
+    console.log(`「${query}」に一致するメールがありません`);
+    return;
+  }
+  const start = prop_('START_DATE');
+  const me = myAddresses_();
+  const domains = internalDomains_();
+
+  threads.forEach((thread) => {
+    const msg = pickMessage_(thread, me);
+    if (!msg) return;
+    const mail = toMail_(msg, thread, domains);
+    const labels = thread.getLabels().map((l) => l.getName());
+    console.log(`==== ${mail.subject}`);
+    console.log(`差出人: ${mail.from} / 受信: ${formatJst_(mail.date, false)}`);
+    console.log(`ラベル: ${labels.join(', ') || '(なし)'}`);
+
+    // 1. 処理対象に入っていたか
+    const inCategory = (cat) => GmailApp.search(`${query} category:${cat}`, 0, 50).some((t) => t.getId() === thread.getId());
+    const reasons = [];
+    if (start && jstYmd_(mail.date, '/') < start.replace(/-/g, '/')) reasons.push(`開始日 ${start} より前`);
+    if (inCategory('promotions')) reasons.push('プロモーションタブ（検索条件 -category:promotions で除外）');
+    if (inCategory('social')) reasons.push('ソーシャルタブ（検索条件 -category:social で除外）');
+    if (labels.indexOf(CONFIG.LABELS.PROCESSED) < 0) {
+      if (!thread.isUnread()) reasons.push('判定前に既読になった可能性（トリアージは未読のみ対象）');
+      else reasons.push('まだ処理されていない（日次上限か、次回の実行待ち）');
+    }
+    console.log(
+      labels.indexOf(CONFIG.LABELS.PROCESSED) >= 0
+        ? '処理状況: 判定済み（_jev あり）。以下は再採点'
+        : `処理状況: 判定されていない → ${reasons.join(' / ') || '原因不明'}`
+    );
+    if (reasons.length && labels.indexOf(CONFIG.LABELS.PROCESSED) >= 0) console.log('参考: ' + reasons.join(' / '));
+
+    // 2. 採点の内訳（Jev の判定は毎回わずかに揺れるので、当時の値はログシートを見る）
+    const a = jevAsk_(buildState_(mail), TRIAGE_QUESTIONS);
+    const r = triageOne_(mail, a);
+    console.log(`再採点: ${r.score}点 [${r.bucket}]（HIGH ≥ ${CONFIG.THRESHOLD_HIGH}, MEDIUM ≥ ${CONFIG.THRESHOLD_MEDIUM}）`);
+    r.parts.forEach((p) => console.log('  ' + p));
+    console.log(
+      `  Jev: 名指し=${r2_(a.addressed_to_me)} 私信=${r2_(a.is_personal)} 自動送信=${r2_(a.is_automated)} 分類=${fmtChoice_(a.category)}`
+    );
+  });
 }
 
 function run_(dry) {

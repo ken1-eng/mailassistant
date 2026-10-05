@@ -120,16 +120,26 @@ function scoreTriage_(a, meta) {
   const urgencyConf = (a.urgency && a.urgency.confidence) || 0;
   const category = (a.category && a.category.choice) || 'other';
   const categoryConf = (a.category && a.category.confidence) || 0;
+  // parts は採点の内訳。explainMail() で「なぜこの点数か」を見るために残す
+  const parts = [];
   const result = (score) => ({
     bucket: bucketFor_(score),
     score: score,
     category: category,
     categoryConf: categoryConf,
+    parts: parts,
   });
+  const r = (v) => Math.round(v * 10) / 10;
 
   // 自動送信・営業は問答無用で落とす
-  if (noul('is_automated') > 0.8) return result(0);
-  if (category === 'sales' && categoryConf > 0.7) return result(0);
+  if (noul('is_automated') > 0.8) {
+    parts.push(`即0点: 自動送信 is_automated=${r(noul('is_automated'))} > 0.8`);
+    return result(0);
+  }
+  if (category === 'sales' && categoryConf > 0.7) {
+    parts.push(`即0点: 営業 category=sales (${r(categoryConf)}) > 0.7`);
+    return result(0);
+  }
 
   let score = 0;
 
@@ -137,28 +147,42 @@ function scoreTriage_(a, meta) {
   // 「返信が要る」は「自分が対応すべきか」で割り引く。
   // 一斉送信の案内でも返信は要るので、足し算にすると効きすぎる。
   const ownership = 0.25 + 0.75 * noul('addressed_to_me');
-  score += noul('needs_reply') * ownership * 35;
+  const reply = noul('needs_reply') * ownership * 35;
+  score += reply;
+  parts.push(`要返信 ${r(reply)}/35（needs_reply=${r(noul('needs_reply'))} × 名指し係数 ${r(ownership)}）`);
   score += noul('is_trouble') * 20;
+  parts.push(`トラブル ${r(noul('is_trouble') * 20)}/20`);
   score += noul('involves_money') * 15;
+  parts.push(`金銭 ${r(noul('involves_money') * 15)}/15`);
 
   // 期限の「近さ」はJevではなくコードで計算した値を使う。日付を特定できなければ加点しない
+  let deadline = 0;
   if (noul('has_deadline') > 0.5 && meta.deadlineDays !== null && meta.deadlineDays !== undefined) {
     const days = meta.deadlineDays;
-    if (days <= 1) score += 25;
-    else if (days <= 3) score += 15;
-    else if (days <= 7) score += 7;
+    if (days <= 1) deadline = 25;
+    else if (days <= 3) deadline = 15;
+    else if (days <= 7) deadline = 7;
     // 8日以上先は加点なし
   }
+  score += deadline;
+  parts.push(
+    `期限 ${deadline}/25（has_deadline=${r(noul('has_deadline'))}, 残り日数=${
+      meta.deadlineDays === null || meta.deadlineDays === undefined ? '特定できず' : meta.deadlineDays
+    }）`
+  );
 
   if (meta.isExternal) score += 5;
+  parts.push(`社外 ${meta.isExternal ? 5 : 0}/5`);
 
   // --- 緊急度は係数として効かせる ---
   // 緊急度ゼロのメールは、他が何点でも上位に来てはいけない。
   const urgencyNorm = Math.min(urgencyRaw / 4, 1);
   const urgencyFactor = 0.25 + 0.75 * urgencyNorm * Math.max(urgencyConf, CONFIG.MIN_CONFIDENCE);
+  parts.push(`小計 ${r(score)} × 緊急度係数 ${r(urgencyFactor * 100) / 100}（urgency=${r(urgencyRaw)}/4, 確信度=${r(urgencyConf)}）`);
   score *= urgencyFactor;
 
   // 私信は業務メールと同じ土俵に乗せない
+  if (noul('is_personal') > 0) parts.push(`私信の割引 ×${r((1 - 0.6 * noul('is_personal')) * 100) / 100}`);
   score *= 1 - 0.6 * noul('is_personal');
 
   return result(Math.round(Math.min(score, 100)));

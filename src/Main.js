@@ -5,6 +5,7 @@
  *   triageInbox()     トリガーから呼ばれる本処理
  *   dryRun()          ラベルもマーカーも付けず、カレンダーにも書かず、採点と記録だけ行う
  *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
+ *   explainMail()     EXPLAIN_QUERY に一致するメールが、なぜその判定になったかを見る
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
  *   resetDailyCount() 1日あたり上限のカウントをリセットする
@@ -147,6 +148,64 @@ function previewLine_(mail, row) {
   parts.push(PREVIEW_REASONS[row.reason] || row.reason || '');
   if (row.note) parts.push(row.note);
   return parts.filter(Boolean).join(' | ');
+}
+
+/**
+ * 1通のメールが「なぜラベルが付かなかったか」を調べる。
+ * スクリプトプロパティ EXPLAIN_QUERY に Gmail の検索条件（例: subject:"Third Bridge"）を入れて実行する。
+ * 1. 処理対象に入っていたか（開始日・プロモーション/ソーシャル・既読・マーカー）
+ * 2. Jev にもう一度聞いて採点の内訳を出す（ラベルもログも書かない。Jev を1回呼ぶ）
+ */
+function explainMail() {
+  const query = prop_('EXPLAIN_QUERY');
+  if (!query) {
+    console.log('スクリプトプロパティ EXPLAIN_QUERY に検索条件を入れてください（例: subject:"Third Bridge"）');
+    return;
+  }
+  const threads = GmailApp.search(query, 0, 3);
+  if (!threads.length) {
+    console.log(`「${query}」に一致するメールがありません`);
+    return;
+  }
+  const start = prop_('START_DATE');
+  const me = myAddresses_();
+  const domains = internalDomains_();
+
+  threads.forEach((thread) => {
+    const msg = pickMessage_(thread, me);
+    if (!msg) return;
+    const mail = toMail_(msg, thread, domains);
+    const labels = thread.getLabels().map((l) => l.getName());
+    console.log(`==== ${mail.subject}`);
+    console.log(`差出人: ${mail.from} / 受信: ${formatJst_(mail.date, false)}`);
+    console.log(`ラベル: ${labels.join(', ') || '(なし)'}`);
+
+    // 1. 処理対象に入っていたか
+    const inCategory = (cat) => GmailApp.search(`${query} category:${cat}`, 0, 50).some((t) => t.getId() === thread.getId());
+    const reasons = [];
+    if (start && jstYmd_(mail.date, '/') < start.replace(/-/g, '/')) reasons.push(`開始日 ${start} より前`);
+    if (inCategory('promotions')) reasons.push('プロモーションタブ（検索条件 -category:promotions で除外）');
+    if (inCategory('social')) reasons.push('ソーシャルタブ（検索条件 -category:social で除外）');
+    if (labels.indexOf(CONFIG.LABELS.PROCESSED) < 0) {
+      if (!thread.isUnread()) reasons.push('判定前に既読になった可能性（トリアージは未読のみ対象）');
+      else reasons.push('まだ処理されていない（日次上限か、次回の実行待ち）');
+    }
+    console.log(
+      labels.indexOf(CONFIG.LABELS.PROCESSED) >= 0
+        ? '処理状況: 判定済み（_jev あり）。以下は再採点'
+        : `処理状況: 判定されていない → ${reasons.join(' / ') || '原因不明'}`
+    );
+    if (reasons.length && labels.indexOf(CONFIG.LABELS.PROCESSED) >= 0) console.log('参考: ' + reasons.join(' / '));
+
+    // 2. 採点の内訳（Jev の判定は毎回わずかに揺れるので、当時の値はログシートを見る）
+    const a = jevAsk_(buildState_(mail), TRIAGE_QUESTIONS);
+    const r = triageOne_(mail, a);
+    console.log(`再採点: ${r.score}点 [${r.bucket}]（HIGH ≥ ${CONFIG.THRESHOLD_HIGH}, MEDIUM ≥ ${CONFIG.THRESHOLD_MEDIUM}）`);
+    r.parts.forEach((p) => console.log('  ' + p));
+    console.log(
+      `  Jev: 名指し=${r2_(a.addressed_to_me)} 私信=${r2_(a.is_personal)} 自動送信=${r2_(a.is_automated)} 分類=${fmtChoice_(a.category)}`
+    );
+  });
 }
 
 function run_(dry) {
