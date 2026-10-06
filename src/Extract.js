@@ -47,6 +47,8 @@ const EXTRACT_SYSTEM_PROMPT = [
   '- title はカレンダーの件名として短く（30字程度）。相手の会社名や会議の種類が分かるようにしてください。',
   '- 仮定や曖昧な点があれば confidence_note に日本語で短く書いてください。無ければ null。',
   '- 予定が複数あるときは、このメールが主に案内している1件を選び、その旨を confidence_note に書いてください。',
+  '- 「受信者本人の返信」があれば、それも踏まえて確定した日時を選んでください（例: 候補のうち受信者が選んだ日）。',
+  '- 開始時刻が「18:30または19:00」のように確定していないときは早い方を start にし、その旨を confidence_note に書いてください。',
   '- 出力はJSONオブジェクトのみ。前置きやMarkdownのコードブロックは付けないでください。',
 ].join('\n');
 
@@ -97,7 +99,9 @@ function extractUserContent_(mail) {
     '',
     '本文:',
     mail.body,
-  ].join('\n');
+  ]
+    .concat(mail.myReply ? ['', '受信者本人の返信（このスレッドで送ったもの）:', mail.myReply] : [])
+    .join('\n');
 }
 
 /** Messages API のレスポンスから抽出結果を取り出す。パースは必ず try-catch で囲む。 */

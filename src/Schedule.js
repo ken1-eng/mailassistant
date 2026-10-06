@@ -39,6 +39,17 @@ const SCHEDULE_QUESTIONS = [
     },
   },
   {
+    // スレッド内の自分の返信（my_reply）があるときだけ効かせる（scheduleGate_ 参照）。
+    // 相手の最新メールが「承知しました」だけでも、出席を返していれば予定は確定している
+    name: 'i_accepted',
+    type: 'noul',
+    instructions: 'my_reply（受信者本人がこのスレッドで送った返信）で、受信者がこの予定への出席を表明しているか。',
+    criteria: {
+      true: '「参加します」「出席させていただきます」「その日時で大丈夫です」など、出席や日時の確定を受信者自身が伝えている',
+      false: 'my_reply が無い、欠席や保留を伝えている、または予定と関係のない返信',
+    },
+  },
+  {
     name: 'schedule_type',
     type: 'choice',
     instructions: 'このメールは予定について何を伝えているか。1つ選んでください。',
@@ -70,8 +81,8 @@ function sameEventQuestions_() {
       type: 'choice',
       instructions: 'mail_event は existing_event に対してどういう関係か。1つ選んでください。',
       criteria: {
-        same: '同じ予定で、日時も変わっていない',
-        rescheduled: '同じ予定の日時が変わった',
+        same: '同じ予定で、日時も変わっていない。終日予定と時刻付き予定の違い、終了時刻や長さの違いだけなら same',
+        rescheduled: '同じ予定の日付や開始時刻が実際に変わった',
         cancelled: '同じ予定が中止になった',
         unrelated: '別の予定',
         cannot_tell: '判断できない',
@@ -83,7 +94,7 @@ function sameEventQuestions_() {
 /**
  * ② の結果から、③ 以降に進むかを決める。
  * @param {Object} a parseJevAnswers_ の結果
- * @param {{isMailingList: boolean}=} meta コード側で求めた値
+ * @param {{isMailingList: boolean, hasMyReply: boolean}=} meta コード側で求めた値
  * @return {{proceed: boolean, notifyOnly: boolean, reason: string}}
  */
 function scheduleGate_(a, meta) {
@@ -93,6 +104,12 @@ function scheduleGate_(a, meta) {
   const type = a.schedule_type || {};
 
   if (v('has_schedule') < th.HAS_SCHEDULE) return gate_(false, false, 'no_schedule');
+  // 自分が出席を返している予定は確定として扱う（相手の最新メールが候補提示や「承知しました」だけでも）。
+  // 変更・中止の連絡と確信できるときはそちらを優先する
+  const accepted = meta.hasMyReply && v('i_accepted') >= th.I_ACCEPTED;
+  const sureChangeOrCancel =
+    (type.choice === 'change' || type.choice === 'cancel') && (type.confidence || 0) >= th.SCHEDULE_TYPE_CONFIDENCE;
+  if (accepted && !sureChangeOrCancel) return gate_(true, false, 'confirmed', 'accepted');
   if (v('i_participate') < th.I_PARTICIPATE) return gate_(false, false, 'not_participant');
   // メーリングリストの一斉連絡は、個人として出席を求められていると分かるときだけ通す
   if (meta.isMailingList && v('personally_invited') < th.PERSONALLY_INVITED) {
@@ -116,16 +133,19 @@ function isMailingList_(headers, subject) {
   return /^\s*(?:(?:re|fw|fwd)\s*[:：]\s*)*[\[【(（][^\]】)）\s]+[:：]\s*\d+[\]】)）]/i.test(String(subject || ''));
 }
 
-function gate_(proceed, notifyOnly, reason) {
-  return { proceed: proceed, notifyOnly: notifyOnly, reason: reason };
+function gate_(proceed, notifyOnly, reason, via) {
+  const g = { proceed: proceed, notifyOnly: notifyOnly, reason: reason };
+  if (via) g.via = via;
+  return g;
 }
 
 /**
  * ⑥ 何をするかを決める（カレンダーには触れない純粋関数）。
  *
  * @param {string} scheduleType ② の schedule_type（confirmed / change / cancel）
- * @param {Array<{isSame: ?number, relation: ?{choice, confidence}}>} matches
+ * @param {Array<{isSame: ?number, relation: ?{choice, confidence}, allDayCovers: ?boolean}>} matches
  *        ④ で見つけた既存予定ごとの ⑤ の結果。0件なら空配列。
+ *        allDayCovers は「既存が終日予定で、メールの時刻付き予定の日を含む」（コード側で求める）
  * @return {{action: string, index: number, reason: string}}
  *        action は create / none / update / mark_cancelled / notify / skip。
  *        index は対象の既存予定（matches の添字）、無ければ -1。
@@ -152,6 +172,11 @@ function decideCalendarAction_(scheduleType, matches) {
   }
 
   const rel = matches[best].relation || {};
+  // 終日の既存予定（Gmail が予約メールから自動で作る「Stay at …」など）と、同じ日の時刻付き予定。
+  // Jev は形の違いを日時変更と読むことがあるが、日付は変わっていないので登録済みとして扱う
+  if (matches[best].allDayCovers && scheduleType !== 'change' && (rel.choice === 'same' || rel.choice === 'rescheduled')) {
+    return act_('none', best, 'already_registered_allday');
+  }
   if ((rel.confidence || 0) < th.RELATION_CONFIDENCE) return act_('notify', best, 'low_confidence_relation');
   switch (rel.choice) {
     case 'same':

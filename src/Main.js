@@ -7,6 +7,7 @@
  *   previewCalendar() 直近7日のメールでカレンダー登録がどうなるかを見る（書き込みなし）
  *   renameLabels()    旧ラベル（即対応・今日中）を新ラベル（緊急・要対応）に移す
  *   retriageMail()    EXPLAIN_QUERY に一致するメールをトリアージし直してラベルを付け直す
+ *   recheckCalendar() EXPLAIN_QUERY に一致するメールの予定登録をやり直す（CAL_STAGE どおりに書き込む）
  *   explainMail()     EXPLAIN_QUERY に一致するメールが、なぜその判定になったかを見る
  *   stop()            自動実行を止める
  *   countTargets()    今の設定で何件が対象になるかを数えるだけ
@@ -90,9 +91,9 @@ function previewCalendar() {
       if (Date.now() - startedAt > CONFIG.RUN_TIME_BUDGET_MS) return;
       const msg = pickMessage_(thread, ctx.me);
       if (!msg) return;
-      const mail = toMail_(msg, thread, ctx.domains);
+      const mail = toMail_(msg, thread, ctx.domains, ctx.me);
       try {
-        const answers = jevAsk_(buildState_(mail), SCHEDULE_QUESTIONS);
+        const answers = jevAsk_(buildState_(mail, true), SCHEDULE_QUESTIONS);
         const row = calendarOne_(mail, answers, ctx);
         logCalendar_('preview', mail, answers, row);
         lines.push({ row: row, text: previewLine_(mail, row) });
@@ -131,6 +132,10 @@ const PREVIEW_REASONS = {
   not_schedule: '予定ではない',
   proposal: '日程調整中（候補提示）',
   low_confidence_type: '予定の種類の判定が曖昧',
+  confirmed: '確定した予定',
+  change: '日時変更の連絡',
+  cancel: '中止の連絡',
+  already_registered_allday: '同じ日の終日予定が既にある',
   no_datetime: '日時を抽出できなかった',
   no_existing: '近くに既存予定なし',
   all_unrelated: '近くの予定はすべて別件',
@@ -176,7 +181,7 @@ function explainMail() {
   threads.forEach((thread) => {
     const msg = pickMessage_(thread, me);
     if (!msg) return;
-    const mail = toMail_(msg, thread, domains);
+    const mail = toMail_(msg, thread, domains, me);
     const labels = thread.getLabels().map((l) => l.getName());
     console.log(`==== ${mail.subject}`);
     console.log(`差出人: ${mail.from} / 受信: ${formatJst_(mail.date, false)}`);
@@ -231,6 +236,41 @@ function retriageMail() {
   threads.forEach((thread) => {
     levels.forEach((l) => thread.removeLabel(l));
     processThread_({ thread: thread, needTriage: true, needCal: false }, ctx);
+  });
+}
+
+/**
+ * EXPLAIN_QUERY に一致するメールの予定登録を、_cal マーカーに関係なくやり直す（最大3スレッド）。
+ * CAL_STAGE どおりに動く（段階4なら仮登録カレンダーに書く）。判定ルールを変えたあとの確認用。
+ * 書き込む前に previewCalendar() で結果を見ておくとよい。
+ */
+function recheckCalendar() {
+  const query = prop_('EXPLAIN_QUERY');
+  if (!query) {
+    console.log('スクリプトプロパティ EXPLAIN_QUERY に検索条件を入れてください（例: subject:"Year end party"）');
+    return;
+  }
+  const stage = calStage_();
+  if (stage < CAL_STAGE.JUDGE) {
+    console.log('CAL_STAGE が 0 なので予定判定は行いません');
+    return;
+  }
+  const threads = GmailApp.search(query, 0, 3);
+  if (!threads.length) {
+    console.log(`「${query}」に一致するメールがありません`);
+    return;
+  }
+  const ctx = { dry: false, stage: stage, me: myAddresses_(), domains: internalDomains_(), ranking: [] };
+  threads.forEach((thread) => {
+    const msg = pickMessage_(thread, ctx.me);
+    if (!msg) return;
+    const mail = toMail_(msg, thread, ctx.domains, ctx.me);
+    const answers = jevAsk_(buildState_(mail, true), SCHEDULE_QUESTIONS);
+    const row = calendarOne_(mail, answers, ctx);
+    logCalendar_('recheck', mail, answers, row);
+    console.log(previewLine_(mail, row));
+    if (mail.myReply) console.log(`  自分の返信: ${mail.myReply.slice(0, 80)} / i_accepted=${r2_(answers.i_accepted)}`);
+    thread.addLabel(label_(CONFIG.LABELS.CAL_PROCESSED));
   });
 }
 
@@ -342,11 +382,11 @@ function processThread_(target, ctx) {
     return;
   }
 
-  const mail = toMail_(msg, thread, ctx.domains);
+  const mail = toMail_(msg, thread, ctx.domains, ctx.me);
   const questions = []
     .concat(target.needTriage ? TRIAGE_QUESTIONS : [])
     .concat(target.needCal ? SCHEDULE_QUESTIONS : []);
-  const answers = jevAsk_(buildState_(mail), questions);
+  const answers = jevAsk_(buildState_(mail, target.needCal), questions);
 
   if (target.needTriage) {
     const r = triageOne_(mail, answers);
@@ -389,9 +429,12 @@ function calendarOne_(mail, a, ctx) {
   const writes = !ctx.dry && ctx.stage >= CAL_STAGE.PROVISIONAL;
 
   // ② 予定を含むか
-  const gate = scheduleGate_(a, { isMailingList: mail.isMailingList });
+  const gate = scheduleGate_(a, { isMailingList: mail.isMailingList, hasMyReply: !!mail.myReply });
   row.reason = gate.reason;
-  if (mail.isMailingList) row.note = `ML personally_invited=${r2_(a.personally_invited)}`;
+  const notes = [];
+  if (mail.isMailingList) notes.push(`ML personally_invited=${r2_(a.personally_invited)}`);
+  if (mail.myReply) notes.push(`自分の返信あり i_accepted=${r2_(a.i_accepted)}${gate.via === 'accepted' ? '（出席表明により確定扱い）' : ''}`);
+  row.note = notes.join(' / ');
   if (!gate.proceed) {
     row.action = gate.notifyOnly ? 'notify' : 'skip';
     if (gate.notifyOnly && writes) notifyCalendar_(mail, null, gate.reason);
@@ -457,9 +500,41 @@ function pickMessage_(thread, me) {
   return null;
 }
 
-function toMail_(msg, thread, domains) {
+/**
+ * スレッド内で自分が送った最新の返信の本文（引用部分を除く）。無ければ null。
+ * 相手の最新メールが「承知しました」だけでも、自分の返信に「参加します」があれば予定は確定している。
+ */
+function myReplyOf_(thread, me) {
+  if (!me || !me.length) return null;
+  const msgs = thread.getMessages();
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (me.indexOf(emailOf_(msgs[i].getFrom())) >= 0) {
+      const text = stripQuoted_(msgs[i].getPlainBody());
+      return text ? text.slice(0, CONFIG.MY_REPLY_LIMIT) : null;
+    }
+  }
+  return null;
+}
+
+/** 返信本文から引用部分（「2026年10月6日(火) … :」や「On … wrote:」以降、「>」で始まる行）を除く。 */
+function stripQuoted_(body) {
+  const lines = String(body || '').split(/\r?\n/);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*>/.test(line)) break;
+    if (/^\s*\d{4}年\d{1,2}月\d{1,2}日.*[:：]\s*$/.test(line)) break;
+    if (/^\s*On .+wrote:\s*$/.test(line)) break;
+    if (/^-{2,}\s*(Original Message|元のメッセージ)/i.test(line)) break;
+    out.push(line);
+  }
+  return out.join('\n').trim();
+}
+
+function toMail_(msg, thread, domains, me) {
   const fullBody = msg.getPlainBody();
   return {
+    myReply: myReplyOf_(thread, me),
     id: msg.getId(),
     threadId: thread.getId(),
     subject: msg.getSubject(),
@@ -484,15 +559,21 @@ function listHeaders_(msg) {
   return { listId: h('List-Id'), listPost: h('List-Post'), precedence: h('Precedence') };
 }
 
-/** Jev に渡す state（既存スクリプトと同じ形）。社外判定と宛先人数はヘッダから分かるのでコード側で入れる */
-function buildState_(mail) {
-  return {
+/**
+ * Jev に渡す state（既存スクリプトと同じ形）。社外判定と宛先人数はヘッダから分かるのでコード側で入れる。
+ * withMyReply のとき（予定判定をするとき）だけ、スレッド内の自分の返信を my_reply として足す。
+ * トリアージだけのときは足さない（採点の分布を変えないため。予定判定と同じリクエストのときはトリアージにも見える）。
+ */
+function buildState_(mail, withMyReply) {
+  const state = {
     subject: mail.subject,
     from: mail.from,
     is_external: mail.isExternal,
     to_count: mail.toCount,
     body: mail.body,
   };
+  if (withMyReply && mail.myReply) state.my_reply = mail.myReply;
+  return state;
 }
 
 function myAddresses_() {

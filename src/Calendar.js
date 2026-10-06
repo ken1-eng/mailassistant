@@ -86,15 +86,31 @@ function describeExtracted_(ev, mailSubject) {
 
 /**
  * ⑤ 既存予定1件ずつ同一判定する。stateに複数の予定を混ぜると判定がぼやける。
- * @return {Array<{isSame: ?number, relation: ?Object, described: Object}>}
+ * @return {Array<{isSame: ?number, relation: ?Object, described: Object, allDayCovers: boolean}>}
  */
 function judgeSameEvents_(found, ev, mail) {
   const extracted = describeExtracted_(ev, mail.subject);
   return found.map((f) => {
     const described = describeEvent_(f.event);
     const a = jevAsk_(sameEventState_(described, extracted), sameEventQuestions_());
-    return { isSame: a.is_same_event, relation: a.relation, described: described };
+    return {
+      isSame: a.is_same_event,
+      relation: a.relation,
+      described: described,
+      allDayCovers: allDayCovers_(f.event, ev),
+    };
   });
+}
+
+/** 既存が終日予定で、メールの時刻付き予定の開始がその期間に入っているか。 */
+function allDayCovers_(e, ev) {
+  if (ev.allDay || !e.isAllDayEvent()) return false;
+  return allDayRangeCovers_(e.getAllDayStartDate(), e.getAllDayEndDate(), ev.start);
+}
+
+/** 終日予定の [開始日0時, 終了日0時) に t が入るか。終了日は翌日0時（排他的）。 */
+function allDayRangeCovers_(startDay, endDay, t) {
+  return startDay.getTime() <= t.getTime() && t.getTime() < endDay.getTime();
 }
 
 /**

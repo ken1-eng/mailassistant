@@ -152,3 +152,86 @@ test('scheduleGate_: ML の一斉連絡は personally_invited が低ければ落
   // ML でも個人として招待されていれば通す
   assert.equal(g.scheduleGate_(sched({ personally_invited: 0.8 }), { isMailingList: true }).proceed, true);
 });
+
+test('scheduleGate_: 自分が出席を返していれば、候補提示や曖昧な種類でも確定として進む', () => {
+  const meta = { hasMyReply: true };
+  const low = sched({ i_accepted: 0.9, schedule_type: { choice: 'confirmed', confidence: 0.5 } });
+  assert.deepEqual(plain(g.scheduleGate_(low, meta)), {
+    proceed: true,
+    notifyOnly: false,
+    reason: 'confirmed',
+    via: 'accepted',
+  });
+  const proposal = sched({ i_accepted: 0.9, schedule_type: { choice: 'proposal', confidence: 0.9 } });
+  assert.equal(g.scheduleGate_(proposal, meta).reason, 'confirmed');
+  // 自分の返信が無ければ i_accepted は見ない
+  assert.equal(g.scheduleGate_(low, { hasMyReply: false }).reason, 'low_confidence_type');
+  assert.equal(g.scheduleGate_(proposal).reason, 'proposal');
+  // 出席表明が弱ければ従来どおり
+  assert.equal(g.scheduleGate_(sched({ i_accepted: 0.5, schedule_type: { choice: 'proposal', confidence: 0.9 } }), meta).reason, 'proposal');
+  // 予定でなければ出席表明があっても進まない
+  assert.equal(g.scheduleGate_(sched({ has_schedule: 0.3, i_accepted: 0.9 }), meta).reason, 'no_schedule');
+});
+
+test('scheduleGate_: 出席表明があっても、確信できる変更・中止の連絡はそのまま', () => {
+  const meta = { hasMyReply: true };
+  const change = sched({ i_accepted: 0.9, schedule_type: { choice: 'change', confidence: 0.9 } });
+  assert.equal(g.scheduleGate_(change, meta).reason, 'change');
+  assert.equal(g.scheduleGate_(change, meta).via, undefined);
+});
+
+test('decideCalendarAction_: 同じ日の終日予定があれば、日時変更と判定されても登録済みとして扱う', () => {
+  const m = [{ isSame: 0.9, relation: rel('rescheduled', 0.9), allDayCovers: true }];
+  assert.deepEqual(plain(g.decideCalendarAction_('confirmed', m)), {
+    action: 'none',
+    index: 0,
+    reason: 'already_registered_allday',
+  });
+  // 関係の確信度が低くても同じ
+  assert.equal(
+    g.decideCalendarAction_('confirmed', [{ isSame: 0.9, relation: rel('same', 0.5), allDayCovers: true }]).action,
+    'none'
+  );
+  // 変更連絡なら従来どおり更新
+  assert.equal(g.decideCalendarAction_('change', m).action, 'update');
+  // 終日予定が別の日なら従来どおり
+  assert.equal(
+    g.decideCalendarAction_('confirmed', [{ isSame: 0.9, relation: rel('rescheduled', 0.9), allDayCovers: false }])
+      .action,
+    'update'
+  );
+});
+
+test('allDayRangeCovers_: 終日予定の期間に時刻が入るか（終了日は排他的）', () => {
+  const s = new Date('2026-10-06T00:00:00+09:00');
+  const e = new Date('2026-10-08T00:00:00+09:00');
+  assert.equal(g.allDayRangeCovers_(s, e, new Date('2026-10-06T18:30:00+09:00')), true);
+  assert.equal(g.allDayRangeCovers_(s, e, new Date('2026-10-07T23:59:00+09:00')), true);
+  assert.equal(g.allDayRangeCovers_(s, e, new Date('2026-10-08T00:00:00+09:00')), false);
+  assert.equal(g.allDayRangeCovers_(s, e, new Date('2026-10-05T23:00:00+09:00')), false);
+});
+
+test('stripQuoted_: 返信本文から引用部分を除く', () => {
+  const body = [
+    '真田様',
+    '',
+    '12/11はもちろん、参加させていただきます。',
+    '',
+    '松葉',
+    '',
+    '2026年10月6日(火) 午前10:24 Maki Sanada <msanada@dcapital.jp>:',
+    '',
+    '> 松葉さま',
+    '> ご都合はいかがでしょうか。',
+  ].join('\n');
+  assert.equal(g.stripQuoted_(body), '真田様\n\n12/11はもちろん、参加させていただきます。\n\n松葉');
+  assert.equal(g.stripQuoted_('OK です\n\nOn Tue, Oct 6, 2026 at 10:24 AM Foo <a@b.c> wrote:\n> hi'), 'OK です');
+  assert.equal(g.stripQuoted_('> 全部引用'), '');
+});
+
+test('buildState_: 予定判定のときだけ自分の返信を my_reply として渡す', () => {
+  const mail = { subject: 's', from: 'f', isExternal: true, toCount: 1, body: 'b', myReply: '参加します' };
+  assert.equal(g.buildState_(mail, true).my_reply, '参加します');
+  assert.equal(g.buildState_(mail, false).my_reply, undefined);
+  assert.equal(g.buildState_(Object.assign({}, mail, { myReply: null }), true).my_reply, undefined);
+});
