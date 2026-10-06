@@ -40,9 +40,9 @@ Gmail の未読メールを Jev で採点して重要度ラベルを付け（①
 1. 既存プロジェクトの `stop()` を実行してトリガーを止める
 2. [clasp](https://github.com/google/clasp) で既存プロジェクトに紐付けて置き換える
    ```sh
-   cp .clasp.json.example .clasp.json   # scriptId を既存プロジェクトのものにする
-   npm test && clasp push               # 既存の .gs は削除される
+   npm run deploy   # テストが通れば clasp push。.clasp.json の scriptId は Apps Script「mailassistant」。既存の .gs は削除される
    ```
+   clasp のログイン情報（`~/.clasprc.json`）は手元の PC で `npx @google/clasp login` を実行すると作られる
    clasp を使わない場合は、エディタで既存ファイルを消し `src/` の各ファイルを同名で作って貼る
    **1ファイルで貼る場合**：`dist/Code.gs` を丸ごと1ファイルに貼ればよい（`src/*.js` を連結したもの。
    `src/` を変更したら `npm run build` で作り直す）。`appsscript.json` は触らなくてよい。

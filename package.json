@@ -5,7 +5,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "build": "node scripts/build.js",
-    "push": "clasp push",
-    "deploy": "npm test && clasp push"
+    "push": "npx -y @google/clasp@3 push",
+    "deploy": "npm test && npx -y @google/clasp@3 push"
   }
 }
